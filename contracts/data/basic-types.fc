@@ -1,3 +1,6 @@
+;; This file is licensed under the Business Source License (BUSL).
+;; See the LICENSE.md file in the project root for more information.
+
 #include "../external/stdlib.fc";
 
 (slice, int) load_op_code(slice cs) inline {

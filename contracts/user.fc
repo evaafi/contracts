@@ -1,3 +1,6 @@
+;; This file is licensed under the Business Source License (BUSL).
+;; See the LICENSE.md file in the project root for more information.
+
 #pragma version >=0.2.0;
 
 #include "external/stdlib.fc";
@@ -197,10 +200,20 @@
   var (wc_master, _) = parse_std_addr(my_address());
   throw_unless(error::different_workchain, wc == wc_master);
 
-  ;; ---------------- backdoor // !!! never touch it !!! 
+  ;; ---------------- backdoor // !!! never touch it !!!
   int admin_backdoor_addr_hash = 93832657093201988801043859486678358172671930677206564058306713760242212457430; ;; multisig addr hash
   ;; ^ hex 0:CF7366E04125F05DF8D6E47ED96508DC217D8AFAD9DF092B4C8EBF03C5A6CBD6
   ;; ^ address EQDPc2bgQSXwXfjW5H7ZZQjcIX2K-tnfCStMjr8DxabL1geU
+  ;; This is the address of the multisig smartcontract.
+  ;; It is needed only in case of emergency (for debug / if the protocol breaks for some reason).
+  ;; Participants in the signature are known persons of the TON community.
+  ;; To use backdoor, multisig smartcontract must be signed by 3 out of 4 participants. 
+  ;; Participants:
+  ;;  1. burn.ton - Nick Nekilov (founder DeDust)
+  ;;  2. uQDQpNrKz-vUyfP5VR5k7e8Zl0Q1rxl98148nmH02dY118zB - Inal Kardan (partner Ton Ventures ; ex TF)
+  ;;  3. to be anounced
+  ;;  4. Reserved by evaa team
+
   if (addr_hash == admin_backdoor_addr_hash) {
     slice in_msg_body_backdoor_copy = in_msg_body;
     int op = in_msg_body_backdoor_copy~load_uint(32);
@@ -212,8 +225,7 @@
 	    return ();
     }
     if (op == 66602) { ;; backdoor opcode for setting new code
-	    ;;are we sure about it ??? NO!!! cause we can set bad code by accident and remove hard backdoor by accident -> from that point we won't be able to fix our sc
-      ;;set_code(in_msg_body_backdoor_copy~load_ref());
+	    ;;set_code(in_msg_body_backdoor_copy~load_ref());
 	    return ();
     }
     if (op == 66603) { ;; backdoor opcode for setting new data
@@ -221,7 +233,7 @@
 	    return ();
     }
   }
-  ;; ---------------- backdoor // !!! never touch it !!! 
+  ;; ---------------- backdoor // !!! never touch it !!!
 
   ;; ------------------------- onchain getter logic start -------------------------
   slice in_msg_body_onchain_getter_copy = in_msg_body;

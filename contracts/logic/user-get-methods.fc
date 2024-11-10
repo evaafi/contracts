@@ -1,3 +1,6 @@
+;; This file is licensed under the Business Source License (BUSL).
+;; See the LICENSE.md file in the project root for more information.
+
 #include "../external/stdlib.fc";
 #include "../storage/user-storage.fc";
 #include "user-utils.fc";

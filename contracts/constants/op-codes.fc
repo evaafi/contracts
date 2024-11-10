@@ -1,3 +1,6 @@
+;; This file is licensed under the Business Source License (BUSL).
+;; See the LICENSE.md file in the project root for more information.
+
 ;; Computing op codes from TL-B schema doesn't really lead to **any** advantages
 ;; furthermore, the protocol is designed to be upgradeable,
 ;; so there CAN'T be a guaranteed fixed schema for messages

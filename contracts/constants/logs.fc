@@ -1,3 +1,6 @@
+;; This file is licensed under the Business Source License (BUSL).
+;; See the LICENSE.md file in the project root for more information.
+
 ;; -- user
 const int log::supply_success = 0x1; 
 const int log::withdraw_success = 0x2;
