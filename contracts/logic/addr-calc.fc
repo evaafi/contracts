@@ -1,0 +1,99 @@
+#include "../external/stdlib.fc";
+#include "../external/ton.fc";
+#include "../storage/user-storage.fc";
+
+cell pack_state_init(cell code, cell data) inline {
+	return begin_cell()
+		.store_uint(0, 2)
+		.store_dict(code)
+		.store_dict(data)
+		.store_uint(0, 1)
+		.end_cell();
+}
+
+(slice) calculate_address (cell state_init) {
+	int wc = get_current_workchain();
+	return begin_cell()
+		.store_uint(4, 3)
+		.store_int(wc, 8)
+		.store_uint(cell_hash(state_init), 256)
+		.end_cell()
+		.begin_parse();
+}
+
+slice calc_address_from_hash (int addr_hash) inline {
+	int wc = get_current_workchain();
+	return begin_cell().store_uint(4, 3)
+	.store_int(wc, 8)
+	.store_uint(addr_hash, 256)
+	.end_cell()
+	.begin_parse();
+}
+
+slice calc_master_wallet_address_from_asset_id(int asset_id, cell token_keys) inline {
+	(int wallet_address_hash, slice data, int flag) = token_keys.udict_get_min?(256);
+	while (flag) {
+		int ticker_hash = data~load_uint(256);
+		if (ticker_hash == asset_id) {
+			return calc_address_from_hash(wallet_address_hash);
+		}
+
+		(wallet_address_hash, data, flag) = token_keys.udict_get_next?(256, wallet_address_hash);
+	}
+	return null();
+}
+;; NOTE: !!! Why is it called platform_address instead of master_address?
+
+;; type_id is in case we need other upgradeable group of contracts
+;; (beyond Users)
+;; the Blank functionality is intended to be universal
+;; it should be possible to reuse it later for whatever comes up
+;; But different groups of contracts should have their own "address space",
+;; that is why we need something in the state_init, which discriminates addresses
+;; in some sense type_id here is somewhat similar to subwallet_id in the standard wallet v3R2,
+;; but also different, because these (Blank) contracts are only intended to share the same upgrade functionality/exterior, but diverge with their "type"/underlying-functionality
+
+;; params - whatever other params other (future) contracts might need
+;; I (nns2009) think it is not necessary to add them here,
+;; because we can always make a new function for a new group of contracts when we need it, but others wanted it to stay
+cell platform::calculate_blank_state_init(
+    cell blank_code,
+    slice platform_address, slice owner_address,
+    int type_id, cell params
+) inline {
+    return pack_state_init(
+        blank_code,
+        begin_cell()
+            .store_slice(platform_address)
+            .store_slice(owner_address)
+            .store_uint(type_id, 8)
+            .store_maybe_ref(params)
+            .end_cell()
+    );
+}
+
+;; Functions to calculate lending-user Smart Contract's state_init
+;; and, correspondingly, lending-user's address
+
+cell calculate_user_init_data(int code_version, slice owner_address) {
+  return user::storage::pack_init(
+    code_version,
+    my_address(),
+    owner_address,
+    new_dict(),
+    user_state::free
+  );
+}
+
+cell calculate_user_state_init(cell blank_code, slice owner_address) {
+  return platform::calculate_blank_state_init(
+    blank_code,
+    my_address(), owner_address,
+    0, null()
+  );
+}
+
+slice calculate_user_address(cell blank_code, slice owner_address) {
+  return calculate_address(calculate_user_state_init(blank_code, owner_address));
+}
+

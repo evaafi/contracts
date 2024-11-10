@@ -1,0 +1,350 @@
+#include "../constants/constants.fc";
+#include "../external/stdlib.fc";
+#include "../constants/errors.fc";
+#include "../constants/logs.fc";
+#include "../data/basic-types.fc";
+#include "../messages/supply-message.fc";
+#include "../logic/addr-calc.fc";
+#include "../logic/master-get-methods.fc";
+#include "../logic/tx-utils.fc";
+#include "../logic/utils.fc";
+
+cell master_core_logic_supply_asset_unchecked(
+  int query_id, int user_version, cell user_code,
+  cell asset_config_collection, cell asset_dynamics_collection,
+  int asset_id, slice owner_address, int amount,
+  int message_send_mode, int forward_ton_amount, cell custom_response_payload,
+  int fwd_fee, int msg_value_for_fee_check
+) impure {
+  ;; Update tracking indexes
+  (_, _, _, _, _, _, _, _, _, _, _, _, int dust, int max_token_amount, _, _, _, _, _
+  ) = asset_config_collection.asset_config_collection:get_unpacked(asset_id);
+
+  asset_dynamics_collection~update_old_rates_and_provided_asset_id(
+    asset_config_collection, asset_id, 0
+  );
+
+  (
+    int s_rate, int b_rate,
+    int total_supply_principal, int total_borrow_principal,
+    int last_accrual, int token_balance,
+    int tracking_supply_index, int tracking_borrow_index,
+    int awaited_supply
+  ) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+
+  int total_supply_principal_with_awaited_supply =
+    total_supply_principal + principal_value_supply_calc(s_rate, awaited_supply);
+
+  cell supply_user_message = pack_supply_user_message(
+      query_id,
+      asset_id, amount,
+      s_rate, b_rate,
+      dust, max_token_amount,
+      total_supply_principal_with_awaited_supply, total_borrow_principal,
+      tracking_supply_index, tracking_borrow_index,
+      forward_ton_amount, custom_response_payload
+    );
+
+  int awaited_supply_with_incoming_amount = awaited_supply + amount;
+
+  int enough_fee = supply_min_attachment(fwd_fee, supply_user_message) + forward_ton_amount;
+
+  throw_unless(
+    error::incoming_asset_transaction_fees,
+    msg_value_for_fee_check > enough_fee
+  );
+
+  asset_dynamics_collection~asset_dynamics_collection:set_packed(
+    asset_id,
+    s_rate, b_rate,
+    total_supply_principal, total_borrow_principal,
+    last_accrual, token_balance,
+    tracking_supply_index, tracking_borrow_index,
+    awaited_supply_with_incoming_amount
+  );
+
+  send_message_to_lending_wallet(
+    BLANK_CODE(), user_version, user_code, owner_address,
+    supply_user_message,
+    message_send_mode
+  );
+
+  return asset_dynamics_collection;
+}
+
+cell supply_jetton(
+  int query_id, int user_version, cell user_code,
+  cell asset_config_collection, cell asset_dynamics_collection,
+  int msg_value, int fwd_fee,
+  int asset_id, slice owner_address, int amount, int forward_ton_amount, cell custom_response_payload
+) impure inline {
+  return master_core_logic_supply_asset_unchecked(
+    query_id, user_version, user_code,
+    asset_config_collection, asset_dynamics_collection,
+    asset_id, owner_address, amount, 64, forward_ton_amount, custom_response_payload,
+    fwd_fee, msg_value + 1 ;; offset by 1 because inside comparison is strict
+  );
+}
+
+() supply_master_jetton_process  (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int jetton_op_code, int query_id, int jetton_amount, slice from_address, int user_version, cell user_code ;; jetton tx body params
+) impure inline {
+  int include_user_code = in_msg_body~load_bool_ext();
+  (slice token_id, int found) = tokens_keys.udict_get?(256, addr_hash);
+  slice recipient_address = in_msg_body~load_msg_addr();
+	int forward_ton_amount = in_msg_body~load_amount();
+  cell custom_response_payload = in_msg_body~load_ref();
+  in_msg_body.end_parse();
+
+  ifnot (is_valid_address?(recipient_address)) {
+    respond_send_jetton(
+      sender_address, from_address,
+      query_id, jetton_amount,
+      begin_cell().store_op_code(error::invalid_address_provided).end_cell(), 0
+    );
+    return ();
+  }
+
+  ifnot (is_valid_custom_response_payload?(custom_response_payload)) {
+    respond_send_jetton(
+      sender_address, from_address,
+      query_id, jetton_amount,
+      begin_cell().store_op_code(error::custom_response_payload_too_big).end_cell(), 0
+    );
+    return ();
+  }
+
+  asset_dynamics_collection = supply_jetton(
+    query_id, user_version, include_user_code ? user_code : null(),
+    asset_config_collection, asset_dynamics_collection,
+    msg_value, fwd_fee,
+    token_id~load_asset_id(), ;; jetton_master_address, <- I am not sure we want this transformation anymore
+    recipient_address, jetton_amount, forward_ton_amount, custom_response_payload
+  );
+  master::storage::save(
+    meta, upgrade_config,
+    asset_config_collection, 
+    if_active, oracles_info, admin, tokens_keys,
+    asset_dynamics_collection
+  );
+  return ();
+}
+
+cell supply_ton(
+  int query_id, int user_version, cell user_code,
+  cell asset_config_collection, cell asset_dynamics_collection,
+  int msg_value, int supply_amount, int fwd_fee,
+  slice owner_address, int forward_ton_amount, cell custom_response_payload
+) impure inline {
+  ;; Withhold some amount of TONs for blockchain fees
+  raw_reserve(supply_amount, reserve::AT_MOST + 2);
+  return master_core_logic_supply_asset_unchecked(
+    query_id, user_version, user_code,
+    asset_config_collection, asset_dynamics_collection,
+    constants::ton_asset_id, owner_address, supply_amount,
+    sendmode::CARRY_ALL_BALANCE, ;; <- in combination with raw_reserve with mode=4
+    ;;^ should resend the whole value of the original message minus "amount" and fees
+    forward_ton_amount, custom_response_payload,
+    fwd_fee, msg_value - supply_amount
+  );
+}
+
+() supply_master_process  (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+  (
+    _, int user_version, _, _, _, cell user_code, _, _
+  ) = upgrade_config.unpack_upgrade_config();
+  int include_user_code = in_msg_body~load_bool_ext(); ;; bool
+
+  int supply_amount = in_msg_body~load_amount();
+  slice recipient_address = in_msg_body~load_msg_addr();
+	int forward_ton_amount = in_msg_body~load_amount();
+  cell custom_response_payload = in_msg_body~load_ref();
+  in_msg_body.end_parse();
+
+  throw_unless(error::invalid_address_provided, is_valid_address?(recipient_address));
+  throw_unless(error::custom_response_payload_too_big, is_valid_custom_response_payload?(custom_response_payload));
+
+  asset_dynamics_collection = supply_ton(
+     query_id, user_version, include_user_code ? user_code : null(),
+    asset_config_collection, asset_dynamics_collection,
+    msg_value, supply_amount, fwd_fee,
+    recipient_address, forward_ton_amount, custom_response_payload
+  );
+
+  master::storage::save(
+    meta, upgrade_config,
+    asset_config_collection, 
+    if_active, oracles_info, admin, tokens_keys,
+    asset_dynamics_collection
+  );
+  return ();
+}
+
+() supply_success_process (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+  (slice owner_address, ;; add new user principal to log
+    int asset_id, int amount_supplied, int user_new_principal,
+    int repay_amount_principal, int supply_amount_principal, cell custom_response_payload) = parse_supply_success_message(in_msg_body);
+
+  ;; Verify this is a message from lending-user smart contract
+
+  throw_unless(
+    error::supply_success_fake_sender,
+    slice_data_equal?(
+      sender_address,
+      calculate_user_address(BLANK_CODE(), owner_address)
+    )
+  );
+
+  (int s_rate, int b_rate,
+   int total_supply_principal, int total_borrow_principal,
+   int last_accrual, int token_balance,
+   int tracking_supply_index, int tracking_borrow_index,
+   int awaited_supply
+  ) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+
+  int new_total_supply = total_supply_principal + supply_amount_principal;
+  int new_total_borrow = total_borrow_principal - repay_amount_principal;
+
+  int new_awaited_supply = awaited_supply - amount_supplied;
+
+  asset_dynamics_collection~asset_dynamics_collection:set_packed(
+    asset_id,
+    s_rate, b_rate,
+    new_total_supply,
+    new_total_borrow,
+    last_accrual,
+    token_balance + amount_supplied, ;; update asset balance
+    ;; ^ We couldn't update it when receiving Supply,
+    ;; because there is no guarantee it would succeed
+    tracking_supply_index, tracking_borrow_index,
+    new_awaited_supply
+  );
+  
+  cell log_data = begin_cell()
+    .store_uint(log::supply_success, 8) ;; supply code
+    .store_slice(owner_address) ;; user addr
+    .store_slice(sender_address) ;; user sc addr
+    .store_uint(now(), 32) ;; current time
+    .store_ref(begin_cell() ;; attached asset data
+      .store_uint(asset_id, 256) 
+      .store_uint(amount_supplied, 64) 
+      .store_int(user_new_principal, 64) 
+      .store_int(new_total_supply, 64) 
+      .store_int(new_total_borrow, 64) 
+      .store_uint(s_rate, 64) 
+      .store_uint(b_rate, 64) 
+      .end_cell())
+    .store_ref(begin_cell().end_cell()) ;; redeemed asset data (nothic cause its supply)
+    .end_cell();
+
+    emit_log_simple(log_data);
+
+    ;; deducting fee::log_tx is NOT neccessary because raw_reserve mode 4 accounts for action phase
+    ;;   (including logs - external out messages) fees
+
+    raw_reserve(0, 4);
+
+  cell body = pack_supply_success_excess_message();
+  slice custom_response_payload_open = custom_response_payload.begin_parse();
+  ifnot (custom_response_payload_open.slice_empty?()) {
+    body = pack_supply_excess_message_with_data(query_id, custom_response_payload);
+  }
+
+  send_message(
+    owner_address,
+    0,
+    body,
+    sendmode::CARRY_ALL_BALANCE 
+  );
+
+  master::storage::save(
+    meta, upgrade_config,
+    asset_config_collection, 
+    if_active, oracles_info, admin, tokens_keys,
+    asset_dynamics_collection
+  );
+  return ();
+}
+
+() supply_fail_process  (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+  var (owner_address, transferred_asset_id, transferred_amount, forward_ton_amount, custom_response_payload) = parse_supply_fail_message(in_msg_body);
+
+  ;; Verify this is a message from lending-user smart contract
+  
+  throw_unless(
+    error::supply_fail_fake_sender,
+    slice_data_equal?(
+      sender_address,
+      calculate_user_address(BLANK_CODE(), owner_address)
+    )
+  );
+  
+  (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(transferred_asset_id);
+
+  (int s_rate, int b_rate,
+    int total_supply_principal, int total_borrow_principal,
+    int last_accrual, int token_balance,
+    int tracking_supply_index, int tracking_borrow_index,
+    int awaited_supply
+  ) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(transferred_asset_id);
+
+  int new_awaited_supply = awaited_supply - transferred_amount;
+
+  asset_dynamics_collection~asset_dynamics_collection:set_packed(
+    transferred_asset_id,
+    s_rate, b_rate,
+    total_supply_principal, total_borrow_principal,
+    last_accrual, token_balance,
+    tracking_supply_index, tracking_borrow_index,
+    new_awaited_supply
+  );
+
+  int supply_fail_fees = modest_fwd_fee_estimation(fwd_fee) + fee::supply_fail;
+
+  msg_value -= supply_fail_fees;
+
+  if (transferred_asset_id == constants::ton_asset_id) {
+    raw_reserve(my_balance - transferred_amount - msg_value, reserve::REGULAR);
+  } else {
+    raw_reserve(0, 4);
+  }
+  
+  send_asset_ext(
+    owner_address, query_id,
+    jw_address_hash, transferred_amount,
+    forward_ton_amount,
+    pack_supply_fail_message_with_data(query_id, custom_response_payload),
+    sendmode::CARRY_ALL_BALANCE 
+  );
+
+  ;; ^ Note how we don't check if that asset is available for refund
+  ;; (same as with liquidation unsatisfied, more on this - there)
+
+  master::storage::save(
+    meta, upgrade_config,
+    asset_config_collection,
+    if_active, oracles_info, admin, tokens_keys,
+    asset_dynamics_collection
+  );
+
+  return ();
+}
+

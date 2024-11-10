@@ -1,0 +1,63 @@
+// This file is licensed under the Business Source License (BUSL).
+// See the LICENSE.md file in the project root for more information.
+
+// Method name: getAccountAssetBalance
+// In args: (asset_id: int, s_rate: int, b_rate: int)
+// Out values: (value: int)
+get_account_asset_balance#_ value:int256 = GetMethodResult;
+
+// Method name: getAccountBalances
+// In args: (asset_dynamics_collection: AssetDynamicsCollection)
+// Out values: (balances: (HashmapE 256 int65)
+get_account_balances#_ balances:(HashmapE 256 int65) = GetMethodResult;
+
+// Method name: getAccountHealth
+// In args: (asset_config_collection: AssetConfigCollection, asset_dynamics_collection: AssetDynamicsCollection, prices_packed: PricesPacked)
+// Out values: (health: int)
+get_account_health#_ health:int256 = GetMethodResult;
+
+// Method name: getAvailableToBorrow
+// In args: (asset_config_collection: AssetConfigCollection, asset_dynamics_collection: AssetDynamicsCollection, prices_packed: PricesPacked)
+// Out values: (value: int)
+get_available_to_borrow#_ value:int256 = GetMethodResult;
+
+// Method name: getIsLiquidable
+// In args: (asset_config_collection: AssetConfigCollection, asset_dynamics_collection: AssetDynamicsCollection, prices_packed: PricesPacked)
+// Out values: (value: Bool)
+get_is_liquidable#_ value:Bool = GetMethodResult;
+
+// Method name: getAggregatedBalances
+// In args: (asset_config_collection: AssetConfigCollection, asset_dynamics_collection: AssetDynamicsCollection, prices_packed: PricesPacked)
+// Out values: (user_total_supply: int, user_total_borrow: int)
+get_aggregated_balances#_ user_total_supply:int256 user_total_borrow:int256 = GetMethodResult;
+
+// Method name: codeVersion
+// In args: ()
+// Out values: (code_version: int)
+code_version#_ code_version:int256 = GetMethodResult;
+
+// Method name: isUserSc
+// In args: ()
+// Out values: (is_user_sc: Bool)
+is_user_sc#_ is_user_sc:Bool = GetMethodResult;
+
+// Method name: get_asset_principal
+// In args: (asset_id: int)
+// Out values: (principal: int)
+get_asset_principal$_ principal:int256 = GetMethodResult;
+
+// Method name: getPrincipals
+// In args: ()
+// Out values: (principals: (HashmapE 256 Principal))
+get_principals#_ principals:(HashmapE 256 Principal) = GetMethodResult;
+
+// Method name: getRewards
+// In args: ()
+// Out values: (rewards: (HashmapE 256 Reward))
+get_rewards#_ rewards:(HashmapE 256 Reward) = GetMethodResult;
+
+// Method name: getAllUserScData
+// In args: ()
+// Out values: (code_version: int, master_address: MsgAddressInt, owner_address: MsgAddressInt, user_principals: (HashmapE 256 Principal), state: int, user_rewards:(HashmapE 256 Reward), backup_cell_1:(Maybe ^Cell), backup_cell_2:(Maybe ^Cell))
+get_all_user_sc_data#_ code_version:int256 master_address:MsgAddressInt owner_address:MsgAddressInt user_principals:(HashmapE 256 Principal) state:int256 rewards:(HashmapE 256 Reward) backup_cell_1:(Maybe ^Cell) backup_cell_2:(Maybe ^Cell) = GetMethodResult;
+

@@ -1,0 +1,41 @@
+#include "../external/stdlib.fc";
+#include "../constants/errors.fc";
+#include "../constants/op-codes.fc";
+#include "../data/basic-types.fc";
+#include "../logic/tx-utils.fc";
+
+() revert_call(
+    slice sender_address, slice owner_address,
+    slice in_msg_body
+) impure method_id(0x770) {
+    {-
+    ;; revert_call_process does not make difference about upgrade_exec
+    ;; this code may be useful in future if there actually will be difference
+    if (update_failed) {
+        ;; If update failed, need to change upgrade_exec to false
+        (int expected_code_version, cell upgrade_info_cell, int upgrade_exec) = in_msg_body~user::upgrade::load_header();
+        builder new_msg_body = begin_cell()
+            .user::upgrade::store_header(expected_code_version, upgrade_info_cell, false)
+            .store_slice(in_msg_body);
+        in_msg_body = new_msg_body.end_cell().begin_parse();
+    }
+    -}
+    
+    send_message(
+        sender_address, 0,
+        begin_cell()
+        .store_op_code(op::revert_call) ;; 32
+        .store_query_id(99999999) ;; 64
+        ;; todo: !! ^ Should maybe use original query_id
+        .store_slice(owner_address) ;; 3+8+256
+        ;; Part above is totalling: 32 + 64 + 3+8+256 = 363 bits,
+        ;; which is significant -> Let's keep in_msg_body in a separate cell
+        .store_ref(
+            begin_cell().store_slice(in_msg_body).end_cell()
+        )
+        .end_cell(),
+        sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
+    );
+    commit(); 
+    throw(error::user_code_version_mismatch);
+}

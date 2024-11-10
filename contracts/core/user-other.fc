@@ -1,0 +1,23 @@
+#include "../external/stdlib.fc";
+#include "../logic/tx-utils.fc";
+#include "../constants/op-codes.fc";
+
+() get_store_process (
+  int query_id, cell in_msg_body, slice sender_address
+) impure inline {
+  cell ds = get_data();
+
+  send_message(
+    sender_address,
+    0,
+    begin_cell()
+      .store_op_code(op::get_store_response)
+      .store_query_id(query_id)
+      .store_ref(in_msg_body)
+      .store_ref(ds)
+    .end_cell(),
+    sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
+  );
+
+  return ();
+}

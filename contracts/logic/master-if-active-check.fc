@@ -1,0 +1,61 @@
+#include "../external/stdlib.fc";
+#include "../constants/op-codes.fc";
+#include "../data/basic-types.fc";
+#include "../data/prices-packed.fc";
+#include "tx-utils.fc";
+
+(int) if_active_process (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body,
+  slice sender_address, int addr_hash, int fwd_fee,
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection
+) impure inline {
+  if (~ slice_data_equal?(sender_address, admin)) { ;; if not Admin
+    slice in_msg_body_copy = in_msg_body; 
+    int op = in_msg_body_copy~load_op_code();
+    int query_id = in_msg_body_copy~load_query_id();
+
+    if ((op == op::supply_master)
+      | (op == op::withdraw_master)
+      | (op == op::liquidate_master)
+      | (op == op::idle_master))
+      ;; ^ one of the "front-facing" op-codes, which initiate new operations
+    {
+      ;; Stop processing and return TONs back to owner
+      throw(error::disabled);
+    } elseif (op == jetton_op::transfer_notification) {
+      ;; If it is jetton supply / jetton liquidate
+      (_, int f) = tokens_keys.udict_get?(256, addr_hash);
+      throw_unless(error::received_unsupported_jetton, f); ;; check jetton is supported
+      ;; NOTE: !! It might be possible to refund unsupported jettons / do we need to refund them?
+
+      int jetton_amount = in_msg_body_copy~load_coins(); 
+      slice from_address = in_msg_body_copy~load_msg_addr();
+      if (~ slice_data_equal?(from_address, admin)) { ;; if not Admin
+        ;; return jettons back to Owner
+        ;; NOTE: !!! will be nice to check that sender has enough TON attachment for gas
+        ;; (here and in other such places)
+        respond_send_jetton(
+          sender_address, from_address,
+          query_id, jetton_amount,
+          begin_cell().store_op_code(error::disabled).store_ref(begin_cell().store_slice(in_msg_body).end_cell()).end_cell(), 0 ;; lets send entire body on disabled so third party can process it ;; todo would be nice to have not a 0 here but some amount setted by sender
+          ;; NOTE: !! Do we need to also store some other info?
+        ); 
+        return ret::stop_execution;
+      }
+      ;; else: Jetton sender is Admin: allow operation
+      ;; although it's not exactly clear:
+      ;; why would Admin want to Supply/Liquidate something while the Protocol is stopped, but let's keep this option open.
+      ;; Maybe some intricate Liquidate cases might arrise that need this kind of fixing?
+    }
+    ;; else: it is one of the "internal" op codes (from User smart contracts to Master)
+    ;; We don't allow owners to initiate new operations,
+    ;; but we allow all ongoing operations to finish processing.
+    ;; The validity of such [internal] requests
+    ;; (that they had been sent by a real User smart contract)
+    ;; is going to be verified as usual in the corresponding op code handlers
+
+    ;; op-code is one of the "internal" ones as described ^
+  }
+  return ret::continue_execution;
+  ;; Sender is Admin (either "directly" or through Jetton transfer) or ^
+}

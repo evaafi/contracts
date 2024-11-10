@@ -1,0 +1,113 @@
+;; I tried to separate error codes into two parts:
+;; Left: WHERE
+;; Right: WHAT
+;; I was rushing and had mixed success
+
+;; ----- Transaction fees -----
+;; E = fEEs
+const int error::claim_asset_reserves_transaction_fees = 0xA2E9;
+const int error::incoming_asset_transaction_fees       = 0x10E9;
+const int error::withdraw_master_transaction_fees      = 0x20E9;
+const int error::liquidate_asset_transaction_fees      = 0x30E9;
+
+;; ----- Supply -----
+;; ----- Withdraw -----
+
+;; ----- Liquidate -----
+
+const int error::master_liquidating_too_much  = 0x30F1;
+const int error::not_liquidatable             = 0x31F2;
+const int error::min_collateral_not_satisfied = 0x31F3; ;; NOTE: !!! I don't like this name: because of soft-checks, there are various reasons min_collateral might not be satisfied. Rename to "low_reward" or something similar
+const int error::user_not_enough_collateral   = 0x31F4;
+const int error::user_liquidating_too_much    = 0x31F5;
+const int error::master_not_enough_liquidity  = 0x31F6;
+
+const int error::liquidation_prices_missing   = 0x31F7;
+
+const int error::liqudation_execution_crashed = 0x31FE;
+
+;; ----- Jettons -----
+
+const int error::received_unsupported_jetton = 0x40FD;
+const int error::unsupported_jetton_op_code  = 0x40FC;
+const int error::jetton_execution_crashed    = 0x40FE;
+
+;; ----- Claim asset reserves -----
+
+const int error::claim_asset_reserves_not_admin  = 0xA2FA;
+const int error::claim_asset_reserves_not_enough = 0xA2F1;
+const int error::claim_asset_reserves_too_much   = 0xA2F9;
+
+;; ----- Wrong sender -----
+
+const int error::message_not_from_admin              = 0x00FA;
+const int error::message_not_from_master             = 0x01FB;
+const int error::different_workchain          = 0x55FF;
+
+const int error::idle_target_not_allowed             = 0x60FC;
+
+const int error::supply_success_fake_sender          = 0x1aFC;
+const int error::supply_fail_fake_sender             = 0x1fFC;
+const int error::withdraw_collateralized_fake_sender = 0x21FC;
+const int error::liquidate_unsatisfied_fake_sender   = 0x3fFC;
+const int error::liquidate_satisfied_fake_sender     = 0x31FC;
+const int error::revert_fake_sender                  = 0xF0FC;
+
+;; ----- Upgrade -----
+
+const int error::upgrade_not_allowed_freeze_too_short = 0xC2F1;
+const int error::upgrade_not_allowed_too_early_update = 0xC2F2;
+const int error::upgrade_not_allowed_too_early_freeze = 0xC2F3;
+const int error::upgrade_not_allowed_new_code_is_empty = 0xC2F4;
+
+const int error::user_code_version_mismatch = 0xC4F4;
+const int error::broken_upgrade_info        = 0xC4F2;
+const int error::unexpected_empty_value     = 0xC4F0;
+const int error::user_data_changed           = 0xC4F1;
+const int error::user_code_broken            = 0xC4F3;
+const int error::user_code_broken_on_upgrade             = 0xC4F5;
+const int error::user_code_broken_on_transaction      = 0xC4F6;
+;; ^ Come up with better/shorter names for these ^
+
+;; ----- Prices -----
+
+const int error::prices_incorrect_signature = 0x50Fa;
+const int error::prices_incorrect_timestamp = 0x50Fe;
+
+const int error::prices_incorrect_sequence        = 0x50F0;
+const int error::prices_incorrect_proof           = 0x50F1;
+const int error::prices_no_such_oracle            = 0x50F2;
+const int error::prices_not_enough_data           = 0x50F3;
+const int error::prices_incorrect_suggested_price = 0x50F4;
+const int error::prices_too_much_data             = 0x50F5;
+const int error::prices_not_positive              = 0x50F6;
+
+;; ----- Locked -----
+
+const int error::disabled                  = 0x70F0;
+
+const int error::user_is_locked            = 0x51F0;
+const int error::user_withdraw_in_progress = 0x31F0;
+
+;; ----- Bounces -----
+
+const int error::bounced_on_master = 0x61FF;
+const int error::bounced_on_blank  = 0x60FF;
+const int error::bounced_on_user   = 0x62FF;
+
+
+;; ----- Others -----
+
+const int error::invalid_address_provided = 0x80FA; ;; A - address
+const int error::custom_response_payload_too_big   = 0x80FB; ;; B - big
+const int error::cant_revert_upgrade_exec = 0x80FC;
+const int error::already_exists           = 0x80FE;
+const int error::we_screwed_up_revert     = 0x80FF;
+
+const int error::around_zero_split_messed_up = 0x80F1;
+const int error::already_inited = 0x80F2;
+const int error::cant_update_dynamics_not_freezed = 0x80F3;
+
+const int error::invalid_data             = 0x8DF0;
+
+const int error::sys::integer_out_of_expected_range = 5;

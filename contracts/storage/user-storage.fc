@@ -1,0 +1,97 @@
+#include "../external/stdlib.fc";
+
+{-
+  user_principals = Dict
+    slice(256) jetton_address -> int(64) value
+
+  user_rewards = Dict
+    slice(256) jetton_address -> int(64) tracking_index, int(64) tracking_accrued
+-}
+
+;; note move all global constants to one file
+;; Added to ^: nns2009: I'd say it makes sense to keep constants at their logical destination
+;; in this case here
+const user_state::free = 0; ;; Fully unlocked state
+const user_state::withdrawing = - (2 << 50); ;; "Big" negative number - big enough such that in case of some theoretical weird subtraction-by-one errors, this number can't be reached regardless
+
+cell user::storage::pack_init(
+  int user_version,
+  slice master_address, slice owner_address,
+  cell user_principals, int state
+) inline method_id(0x13001) {
+  return begin_cell()
+    .store_coins(user_version)
+    .store_slice(master_address)
+    .store_slice(owner_address)
+    ;; The part above ^ MUST stay fixed,
+    ;; because User's "entry" (=upgrade handling) code expects these fields
+    .store_dict(user_principals)
+    .store_int(state, 64)
+  .end_cell();
+}
+
+cell user::storage::pack(
+  int user_version,
+  slice master_address, slice owner_address,
+  cell user_principals, int state,
+  cell user_rewards, cell backup_cell_1, cell backup_cell_2
+) inline method_id(0x130) {
+  return begin_cell()
+    .store_coins(user_version)
+    .store_slice(master_address)
+    .store_slice(owner_address)
+    ;; The part above ^ MUST stay fixed,
+    ;; because User's "entry" (=upgrade handling) code expects these fields
+    .store_dict(user_principals)
+    .store_int(state, 64)
+    .store_dict(user_rewards)
+    .store_maybe_ref(backup_cell_1)
+    .store_maybe_ref(backup_cell_2)
+  .end_cell();
+}
+
+() user::storage::save (
+  int user_version,
+  slice master_address, slice owner_address,
+  cell user_principals, int state,
+  cell user_rewards, cell backup_cell_1, cell backup_cell_2
+) impure method_id(0x133) {
+  set_data(user::storage::pack(
+    user_version, master_address, owner_address,
+    user_principals, state,
+    user_rewards, backup_cell_1, backup_cell_2
+  ));
+}
+
+(int, slice, slice, cell, int, cell, cell, cell) user::storage::load () {
+  slice ds = get_data().begin_parse();
+  int code_version = ds~load_coins();
+  slice master_address = ds~load_msg_addr();
+  slice owner_address = ds~load_msg_addr();
+  cell user_principals = ds~load_dict();
+  int state = ds~load_int(64);
+  cell user_rewards = ds~load_dict();
+  cell backup_cell_1 = ds~load_maybe_ref();
+  cell backup_cell_2 = ds~load_maybe_ref();
+  
+  ;; note
+  ;; we cant add ds.end_parse() here because there is some amount of 0000 left in the store data if we just upgraded code version from < v6
+
+  ;; 34/ all of our user sc-s have code version >= 2, so there is 64 + 64 + 32 zeros and one REF after state variable in the store of all of the user sc-s
+  ;; so, in new version (v6) we will have in user load function
+  ;; cell user_rewards = ds~load_dict();
+  ;; cell backup_cell_1 = ds~load_maybe_ref();
+  ;; cell backup_cell_2 = ds~load_maybe_ref();
+  ;; that will load 3 nulls (when you have …000000000… and etc in the store, load_ref() from …00000000… will return null)
+  ;; so, in upgrade logic we will not change the storage, but on the firs sc invocation after upgrade store will re-write itself with 
+  ;; .store_dict(user_rewards)
+  ;; .store_maybe_ref(backup_cell_1)
+  ;; .store_maybe_ref(backup_cell_2)
+
+  return (code_version, master_address, owner_address, user_principals, state, user_rewards, backup_cell_1, backup_cell_2);
+}
+
+cell user::storage::load_principals () inline {
+    (_, _, _, cell user_principals, _, _, _, _) = user::storage::load();
+    return user_principals;
+}

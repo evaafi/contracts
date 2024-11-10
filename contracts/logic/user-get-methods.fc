@@ -1,0 +1,97 @@
+#include "../external/stdlib.fc";
+#include "../storage/user-storage.fc";
+#include "user-utils.fc";
+#include "master-utils.fc";
+
+(int) getAccountAssetBalance (int asset_id, int s_rate, int b_rate) method_id {
+  cell user_principals = user::storage::load_principals();
+  int res = get_account_asset_balance(asset_id, s_rate, b_rate, user_principals);
+  return res;
+}
+
+(cell) getAccountBalances (cell asset_dynamics_collection) method_id {
+  cell user_principals = user::storage::load_principals();
+  (int asset_id, slice asset_value_principal_packed, int flag) = user_principals.principals:get_min?();
+  cell account_balances = new_dict();
+  while (flag) {
+    int asset_value_principal = asset_value_principal_packed.packed_principal:unpack();
+
+    var (asset_s_rate, asset_b_rate, total_supply_principal, total_borrow_principal, last_accrual, token_balance, _, _, _) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+
+    int balance = present_value(asset_s_rate, asset_b_rate, asset_value_principal);
+    ;; int balance = get_account_asset_balance(asset_id, asset_s_rate, asset_b_rate, user_principals);
+    ;; Function get_account_asset_balance first fetches the corresponding principal from the dictionary
+    ;; by asset_id, but it's not necessary because we already have it as part of enumeration
+    account_balances~udict_set(256, asset_id, begin_cell().store_int(balance, 65).end_cell().begin_parse()); ;; nns2009 -> todo@sepezho: !! I did a project-wide search for 65, but I didn't quite understand why this specific number was chosen
+    (asset_id, asset_value_principal_packed, flag) = user_principals.principals:get_next?(asset_id);
+  }
+  return (account_balances);
+}
+
+(int) getAccountHealth (cell asset_config_collection, cell asset_dynamics_collection, cell prices_packed) method_id {
+  cell user_principals = user::storage::load_principals();
+  (int result, _) = account_health_calc(asset_config_collection, asset_dynamics_collection, user_principals, prices_packed);
+  return result;
+}
+
+(int) getAvailableToBorrow (cell asset_config_collection, cell asset_dynamics_collection, cell prices_packed) method_id {
+  cell user_principals = user::storage::load_principals();
+  (int result, _) = get_available_to_borrow(
+    asset_config_collection, asset_dynamics_collection,
+    user_principals, prices_packed
+  );
+  return result;
+}
+
+;; ??? todo: this method is questionable to have on user, because it takes space on every user-instance
+;; It should probably be moved to the master
+(int) getIsLiquidable (cell asset_config_collection, cell asset_dynamics_collection, cell prices_packed) method_id {
+  cell user_principals = user::storage::load_principals();
+  (int result, _, _, _) = is_liquidatable(asset_config_collection, asset_dynamics_collection, user_principals, prices_packed);
+  return result;
+}
+
+(int, int) getAggregatedBalances (cell asset_config_collection, cell asset_dynamics_collection, cell prices_packed) method_id {
+  cell user_principals = user::storage::load_principals();
+  (int res1, int res2, _) = get_agregated_balances(asset_config_collection, asset_dynamics_collection, user_principals, prices_packed);
+  return (res1, res2);
+}
+
+(int) codeVersion() method_id {
+  (int code_version, _, _, _, _, _, _, _) = user::storage::load();
+  return code_version;
+}
+
+(int) isUserSc () method_id {
+  return (-1); ;;for liquidation bot
+}
+
+;; nns2009 added for Testing
+int get_asset_principal(int asset_id) method_id {
+  cell user_principals = user::storage::load_principals();
+  return user_principals.get_principal(asset_id);
+}
+
+cell getPrincipals () method_id {
+  cell user_principals = user::storage::load_principals();
+  return user_principals;
+}
+
+cell getRewards () method_id {
+  (_, _, _, _, _, cell user_rewards, _, _) = user::storage::load();
+  return user_rewards;
+}
+
+(int, slice, slice, cell, int, cell, cell, cell) getAllUserScData () method_id {
+  return user::storage::load();
+}
+
+(int) get_maximum_withdraw_amount(int asset_id, cell prices_packed, cell asset_config_collection, cell asset_dynamics_collection) method_id {
+  cell user_principals = user::storage::load_principals();
+  int old_principal = user_principals.get_principal(asset_id);
+  (int result, _) = calculate_maximum_withdraw_amount(
+    asset_config_collection, asset_dynamics_collection,
+    user_principals, prices_packed, asset_id, old_principal
+  );
+  return result;
+}

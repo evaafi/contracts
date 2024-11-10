@@ -1,0 +1,119 @@
+;; Computing op codes from TL-B schema doesn't really lead to **any** advantages
+;; furthermore, the protocol is designed to be upgradeable,
+;; so there CAN'T be a guaranteed fixed schema for messages
+
+;; Let's assign op codes, so they make some kind of sense
+;; and it's easier to do debugging.
+
+;; op codes encode the sequence of transactions
+
+;; Mnemonics:
+;; A = Admin
+;; D = Debug
+;; E = Edit
+;; F = Fail
+;; a = accept
+;; e = excess
+;; f = fail
+;; d = Dai(Russian) or Dar(Spanish) = send
+
+;; In the ending:
+;; low number = Yes/Good,
+;; high number = No/Bad
+
+;; Comment indicates who RECEIVES the message
+
+
+const int op::get_store  = 0x9998; ;; 
+const int op::get_store_response  = 0x9999; ;; 
+
+
+;; ----- Supply -----
+
+const int op::supply_master  = 0x1; ;; master
+const int op::supply_user    = 0x11; ;; user
+const int op::supply_success = 0x11a; ;; master (from user)
+const int op::supply_fail    = 0x11f; ;; master (from user)
+const int op::supply_excess  = 0x11ae; ;; owner
+const int op::supply_fail_excess = 0x11ae1;
+
+;; ----- Withdraw -----
+
+const int op::withdraw_master                    = 0x2; ;; master (from owner)
+const int op::withdraw_user                      = 0x21; ;; user
+const int op::withdraw_collateralized            = 0x211; ;; master (from user)
+const int op::withdraw_success                   = 0x211a; ;; user
+const int op::withdraw_fail                      = 0x211f; ;; user
+
+const int op::withdraw_locked_excess             = 0x21e6;
+const int op::withdraw_not_collateralized_excess = 0x21e7;
+const int op::withdraw_no_funds_excess           = 0x211fe8;
+;; const int op::withdraw_success_excess = 69;
+;; ^ this op code doesn't exist because
+;; Withdraw success excess refund happens as part of send_asset
+
+const int op::withdraw_missing_prices_excess     = 0x21e8;
+
+const int op::withdraw_execution_crashed         = 0x21ec;
+
+;; ----- Liquidate -----
+
+const int op::liquidate_master         = 0x3; ;; master (from liquidator)
+const int op::liquidate_user           = 0x31; ;; user
+const int op::liquidate_unsatisfied    = 0x31f; ;; master (from user)
+const int op::liquidate_satisfied      = 0x311; ;; master (from user)
+const int op::liquidate_success        = 0x311a; ;; user
+const int op::liquidate_success_report = 0x311d; ;; liquidator (from master)
+const int op::liquidate_success_report_to_user = 0x311d1;
+const int op::liquidate_fail           = 0x311f; ;; user
+
+
+;; ----- Idle -----
+
+const int op::idle_master = 0x8; ;; master
+const int op::idle_user   = 0x81; ;; user
+const int op::idle_excess = 0x81e; ;; originator
+;; ^ needed to upgrade User smart contract without executing anything
+
+;; ----- Do nothing -----
+
+const int op::do_data_checks = 0xD001; ;; DO Data Checks
+;; ^ used for testing after upgrade or config changes
+
+;; ----- Revert -----
+
+const int op::revert_call = 0xF;
+
+
+
+;; ----- Admin -----
+
+const int op::init_master          = 0xA1;
+const int op::claim_asset_reserves = 0xA2; ;; (from admin)
+;; const int op::init_user = 2;
+;; const int op::update_price = 3; ;; (from jw_address_hash)
+const int op::update_dynamics = 0xA4; ;; (from admin)
+
+const int op::update_config           = 0xE4; ;; (from admin)
+const int op::update_full_config           = 0xE41; ;; (from admin)
+const int op::debug_principals_edit_master = 0xD2; ;; (from admin)
+const int op::debug_principals_edit_user   = 0xD21; ;; (from admin)
+;; const int op::upgrade_config = 3500;
+;; const int op::packed_supply = 3700;
+const int op::add_new_token = 0xA32; ;; (from admin)
+
+;; ----- Admin -----
+
+const int op::force_enable                 = 0xE1;
+const int op::disable_contract_for_upgrade = 0xE8;
+const int op::force_disable_contract       = 0xE9;
+;; ^ NOTE: !! I question having two different operations for contract disabling
+
+
+;; ----- Upgrade -----
+
+const int op::init_upgrade   = 0xC1; ;; (from admin)
+const int op::submit_upgrade = 0xC2; ;; (from admin)
+const int op::cancel_upgrade = 0xC9; ;; (from admin)
+
+

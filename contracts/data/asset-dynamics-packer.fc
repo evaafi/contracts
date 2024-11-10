@@ -1,0 +1,98 @@
+#include "../constants/errors.fc";
+#include "../external/stdlib.fc";
+#include "basic-types.fc";
+
+;; --------------- Structure methods ---------------
+
+cell pack_asset_dynamics(
+	int s_rate, int b_rate,
+	int total_supply_principal, int total_borrow_principal,
+	int last_accrual, int token_balance,
+	int tracking_supply_index, int tracking_borrow_index,
+	int awaited_supply
+) {
+	throw_if(error::sys::integer_out_of_expected_range, total_supply_principal < 0);
+	throw_if(error::sys::integer_out_of_expected_range, total_borrow_principal < 0);
+	return begin_cell()
+		.store_sb_rate(s_rate)
+		.store_sb_rate(b_rate)
+		.store_principal(total_supply_principal)
+		.store_principal(total_borrow_principal)
+		.store_timestamp(last_accrual)
+		.store_balance(token_balance)
+		.store_tracking_index(tracking_supply_index)
+		.store_tracking_index(tracking_borrow_index)
+		.store_balance(awaited_supply)
+		.end_cell();
+}
+
+(int, int, int, int, int, int, int, int, int) unpack_asset_dynamics(slice asset_dynamics) {
+	int asset_s_rate = asset_dynamics~load_sb_rate();
+	int asset_b_rate = asset_dynamics~load_sb_rate();
+	
+	int total_supply_principal = asset_dynamics~load_principal();
+	int total_borrow_principal = asset_dynamics~load_principal();
+	;; we dont need load_int here
+	;; nns2009: ... yes, but:
+	;; 1) "unpack" has to mirror "pack" to avoid future surprises
+	;; 2) All principals across the project are stored consistently to avoid confusion
+	;; 3) In a theoretical case there is a "de-sync" (total_*_principal doesn't match the sum of all Users' principals), it's preferrable that:
+	;; - total_*_principal becomes negative
+	;; - utilization becomes negative
+	;; - supply_interest and borrow_interest become of different signs
+	;;   => So interest accumulation works incorrectly,
+	;; + But *slowly* and *gradually* incorrectly accumulating percentages,
+	;;   instead of the protocol stopping entirely
+	;;   with inability to even Withdraw/Reclaim your own assets
+	
+	int last_accrual = asset_dynamics~load_timestamp();
+	int token_balance = asset_dynamics~load_balance();
+	int tracking_supply_index = asset_dynamics~load_tracking_index();
+	int tracking_borrow_index = asset_dynamics~load_tracking_index();
+	int awaited_supply = asset_dynamics~load_balance();
+	
+	return (
+		asset_s_rate, asset_b_rate,
+		total_supply_principal, total_borrow_principal,
+		last_accrual, token_balance,
+		tracking_supply_index, tracking_borrow_index,
+		awaited_supply
+	);
+}
+
+;; --------------- Collection methods ---------------
+
+(int, int, int, int, int, int, int, int, int) asset_dynamics_collection:get_unpacked(
+	cell asset_dynamics_collection, int asset_id
+) {
+	(slice asset_dynamics, _) = asset_dynamics_collection.udict_get?(256, asset_id);
+	return unpack_asset_dynamics(asset_dynamics);
+}
+
+(cell, ()) asset_dynamics_collection:set_packed( 
+	cell asset_dynamics_collection, int asset_id,
+	int s_rate, int b_rate,
+	int total_supply_principal, int total_borrow_principal,
+	int last_accrual, int token_balance,
+ 	int tracking_supply_index, int tracking_borrow_index,
+	int awaited_supply
+) {
+	cell asset_dynamics = pack_asset_dynamics(
+		s_rate, b_rate,
+		total_supply_principal, total_borrow_principal,
+		last_accrual, token_balance,
+		tracking_supply_index, tracking_borrow_index,
+		awaited_supply
+	);
+
+	return (asset_dynamics_collection.udict_set(
+		256, asset_id, asset_dynamics.begin_parse() 
+	), ());
+}
+
+int asset_dynamics_collection:has?(
+	cell asset_dynamics_collection, int asset_id
+) {
+	(_, int f) = asset_dynamics_collection.udict_get?(256, asset_id);
+	return f;
+}

@@ -1,0 +1,108 @@
+#include "../external/stdlib.fc";
+#include "../data/basic-types.fc";
+
+;; --------------- Structure methods ---------------
+
+(int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int) unpack_asset_config(slice asset_config) {
+	int jw_address_hash = asset_config~load_uint(256); 
+	int decimals = asset_config~load_uint(8);
+	
+	cell asset_config_params_packed = asset_config~load_ref();
+	slice asset_config_params = asset_config_params_packed.begin_parse();
+
+	int collateral_factor = asset_config_params~load_uint(16);
+	int liquidation_threshold = asset_config_params~load_uint(16); 
+	int liquidation_bonus = asset_config_params~load_uint(16);
+	int base_borrow_rate = asset_config_params~load_uint(64); 
+	int borrow_rate_slope_low = asset_config_params~load_uint(64); 
+	int borrow_rate_slope_high = asset_config_params~load_uint(64);
+	int supply_rate_slope_low = asset_config_params~load_uint(64); 
+	int supply_rate_slope_high = asset_config_params~load_uint(64);
+	int target_utilization = asset_config_params~load_uint(64);
+	int origination_fee = asset_config_params~load_uint(64);
+	int dust_value = asset_config_params~load_uint(64);
+	int max_total_supply = asset_config_params~load_uint(64);
+	int reserve_factor = asset_config_params~load_uint(16);
+	int liquidation_reserve_factor = asset_config_params~load_uint(16); 
+	int min_principal_for_rewards = asset_config_params~load_uint(64); 
+	int base_tracking_supply_speed = asset_config_params~load_uint(64); 
+	int base_tracking_borrow_speed = asset_config_params~load_uint(64); 
+
+  return (
+		jw_address_hash, decimals,
+		collateral_factor, liquidation_threshold,
+		liquidation_bonus, base_borrow_rate,
+		borrow_rate_slope_low, borrow_rate_slope_high,
+		supply_rate_slope_low, supply_rate_slope_high,
+		target_utilization, origination_fee,
+		dust_value, max_total_supply,
+		reserve_factor, liquidation_reserve_factor,
+		min_principal_for_rewards, base_tracking_supply_speed,
+		base_tracking_borrow_speed
+	);
+}
+
+cell pack_asset_config(
+		int jw_address_hash, int decimals,
+		int collateral_factor,
+		int liquidation_threshold, int liquidation_bonus,
+		int base_borrow_rate, int borrow_rate_slope_low,
+		int borrow_rate_slope_high, int supply_rate_slope_low,
+		int supply_rate_slope_high, int target_utilization,
+		int origination_fee, int dust_value, int max_total_supply,
+		int reserve_factor, int liquidation_reserve_factor,
+		int min_principal_for_rewards, int base_tracking_supply_speed,
+		int base_tracking_borrow_speed
+) {
+	return begin_cell()
+		.store_uint(jw_address_hash, 256)
+		.store_uint(decimals, 8) 
+		.store_ref(begin_cell()
+			.store_uint(collateral_factor, 16) 
+			.store_uint(liquidation_threshold, 16) 
+			.store_uint(liquidation_bonus, 16)
+			.store_uint(base_borrow_rate, 64) 
+			.store_uint(borrow_rate_slope_low, 64) 
+			.store_uint(borrow_rate_slope_high, 64) 
+			.store_uint(supply_rate_slope_low, 64) 
+			.store_uint(supply_rate_slope_high, 64) 
+			.store_uint(target_utilization, 64)
+			.store_uint(origination_fee, 64)
+			.store_uint(dust_value, 64)
+			.store_uint(max_total_supply, 64)
+			.store_uint(reserve_factor, 16)
+			.store_uint(liquidation_reserve_factor, 16)
+			.store_uint(min_principal_for_rewards, 64)
+			.store_uint(base_tracking_supply_speed, 64)
+			.store_uint(base_tracking_borrow_speed, 64)
+		.end_cell())
+	.end_cell();
+}
+
+
+
+;; --------------- Collection methods ---------------
+
+(int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int)
+	asset_config_collection:get_unpacked(cell asset_config_collection, int asset_id)
+{
+	(slice asset_config, _) = asset_config_collection.udict_get?(256, asset_id);
+	return unpack_asset_config(asset_config);
+}
+
+;; for future use
+int asset_config_collection:get_jetton_wallet(cell asset_config_collection, int asset_id)
+{
+	(slice asset_config, _) = asset_config_collection.udict_get?(256, asset_id);
+	(int jetton_wallet, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config.unpack_asset_config();
+	return jetton_wallet;
+}
+
+int asset_config_collection:decimals(cell asset_config_collection, int asset_id) {
+	(slice asset_config, _) = asset_config_collection.udict_get?(256, asset_id);
+	
+	asset_config~load_address_hash(); ;; jw_address_hash
+	return asset_config.preload_uint(8); ;; decimals
+}
+
+

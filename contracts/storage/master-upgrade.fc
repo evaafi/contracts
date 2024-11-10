@@ -1,0 +1,119 @@
+#include "../external/stdlib.fc";
+#include "../data/universal-dict.fc";
+
+;; --------------- upgrade_config ---------------
+
+(cell) pack_upgrade_config(
+    int master_code_version, int user_code_version,
+    int timeout, int update_time, int freeze_time,
+    cell user_code,
+    cell new_master_code, cell new_user_code
+) inline {
+    return (
+        begin_cell()
+            .store_coins(master_code_version)
+            .store_coins(user_code_version)
+            .store_uint(timeout, 32)
+            .store_uint(update_time, 64)
+            .store_uint(freeze_time, 64)
+            .store_ref(user_code)
+            .store_maybe_ref(new_master_code)
+            .store_maybe_ref(new_user_code)
+    ).end_cell();
+}
+
+(int, int, int, int, int, cell, cell, cell) unpack_upgrade_config(cell config) inline {
+    slice cs = config.begin_parse();
+    return (
+        cs~load_coins(), cs~load_coins(),
+        cs~load_uint(32), cs~load_uint(64), cs~load_uint(64),
+        cs~load_ref(), cs~load_maybe_ref(), cs~load_maybe_ref()
+    );
+}
+
+int upgrade_config:user_code_version(cell config) inline {
+    slice cs = config.begin_parse();
+    cs~load_coins(); ;; Skip master_code_version
+    return cs~load_coins(); ;; Return user_code_version
+}
+
+;; --------------- Master's universal_storage ---------------
+
+(cell) master::upgrade::pack_universal_storage(
+    cell meta, cell upgrade_config, cell asset_config_collection,
+    int if_active, slice oracles_info, slice admin, cell tokens_keys,
+     cell asset_dynamics_collection
+) method_id(0x153) {
+    cell storage = new_dict();
+    storage~udict_set_builder(
+        256, "meta"H,
+        begin_cell().store_ref(meta)
+    );
+    storage~udict_set_builder(
+        256, "upgrade_config"H,
+        begin_cell().store_ref(upgrade_config)
+    );
+    storage~udict_set_builder(
+        256, "asset_config_collection"H,
+        begin_cell().store_dict(asset_config_collection)
+    );
+    storage~udict_set_builder(
+        256, "if_active"H,
+        begin_cell().store_int(if_active, 8)
+    );
+     storage~udict_set_builder(
+        256, "oracles_info"H,
+        begin_cell().store_slice(oracles_info)
+    );
+    storage~udict_set_builder(
+        256, "admin"H,
+        begin_cell().store_slice(admin)
+    );
+    storage~udict_set_builder(
+        256, "tokens_keys"H,
+        begin_cell().store_dict(tokens_keys)
+    );
+    storage~udict_set_builder(
+        256, "asset_dynamics_collection"H,
+        begin_cell().store_dict(asset_dynamics_collection)
+    );
+    return storage;
+}
+
+(cell) master::upgrade::unpack_universal_storage(cell storage) method_id(0x157) {
+    builder new_storage = begin_cell();
+
+    slice value = storage.upgrade_storage:get!("meta"H);
+    new_storage = new_storage.store_ref(value~load_ref());
+
+    slice value = storage.upgrade_storage:get!("upgrade_config"H);
+    new_storage = new_storage.store_ref(value~load_ref());
+
+    builder new_storage_ref = begin_cell();
+    {
+        slice value = storage.upgrade_storage:get!("asset_config_collection"H);
+        new_storage_ref = new_storage_ref.store_dict(value~load_dict());
+
+        slice value = storage.upgrade_storage:get!("if_active"H);
+        new_storage_ref = new_storage_ref.store_int(value~load_int(8), 8);
+
+        slice value = storage.upgrade_storage:get!("admin"H);
+        new_storage_ref = new_storage_ref.store_slice(value);
+
+        slice value = storage.upgrade_storage:get!("admin_pk"H);
+        new_storage_ref = new_storage_ref.store_slice(value);
+        
+        slice value = storage.upgrade_storage:get!("tokens_keys"H);
+        new_storage_ref = new_storage_ref.store_dict(value~load_dict());
+
+        slice value = storage.upgrade_storage:get!("wallet_to_master"H);
+        new_storage_ref = new_storage_ref.store_dict(value~load_dict());
+    }
+    new_storage = new_storage.store_ref(new_storage_ref.end_cell());
+
+    slice value = storage.upgrade_storage:get!("asset_dynamics_collection"H);
+    new_storage = new_storage.store_dict(value~load_dict());
+
+    return new_storage.end_cell();
+}
+

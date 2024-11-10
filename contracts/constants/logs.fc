@@ -1,0 +1,19 @@
+;; -- user
+const int log::supply_success = 0x1; 
+const int log::withdraw_success = 0x2;
+const int log::liquidate_success = 0x3;
+;; -- admin
+const int log::update_config = 0x4;
+const int log::update_full_config = 0x5;
+const int log::claim_asset_reserves = 0x6;
+const int log::update_dynamics = 0x7;
+const int log::enable = 0x8;
+const int log::disable = 0x9;
+const int log::disable_for_upgrade = 0x10;
+const int log::init_upgrade = 0x11;
+const int log::submit_upgrade = 0x12;
+const int log::cancel_upgrade = 0x13;
+;; const int log::add_new_token_dynamics = 0x14;
+const int log::add_new_token = 0x15;
+;; -- crash
+const int log::execution_crashed = 0xec;

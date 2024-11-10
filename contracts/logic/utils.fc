@@ -1,0 +1,92 @@
+#include "../constants/constants.fc";
+#include "../data/prices-packed.fc";
+#include "../data/asset-config-packer.fc";
+#include "../external/openlib.fc";
+
+(int) present_value_supply_calc (int index, int principal_value) inline {
+  return muldiv(principal_value, index, constants::factor_scale);
+}
+
+(int) present_value_borrow_calc (int index, int principal_value) inline {
+  return muldivc(principal_value, index, constants::factor_scale);
+}
+
+(int) principal_value_supply_calc (int s_rate, int present_value) inline {
+  return s_rate > 0 ? muldiv(present_value, constants::factor_scale, s_rate) : 0;
+}
+
+(int) principal_value_borrow_calc (int b_rate, int present_value) inline {
+  ;; was: (present_value * constants::factor_scale + b_rate - 1) / b_rate
+  ;; adding (b_rate - 1) before dividing by b_rate is equivalent to rounding up (muldivc)
+  return b_rate > 0 ? muldivc(present_value, constants::factor_scale, b_rate) : 0;
+}
+
+(int) present_value(int s_rate, int b_rate, int principal_value) inline {
+  if (principal_value >= 0) {
+    return present_value_supply_calc(s_rate, principal_value);
+  } else {
+    return present_value_borrow_calc(b_rate, principal_value);
+  }
+}
+
+(int) principal_value(int s_rate, int b_rate, int present_value) inline {
+  if (present_value >= 0) {
+    return principal_value_supply_calc(s_rate, present_value);
+  } else {
+    return principal_value_borrow_calc(b_rate, present_value);
+  }
+}
+
+(int, int) around_zero_split(int lower, int upper) {
+  int below = 0;
+  int above = 0;
+  
+  throw_if(error::around_zero_split_messed_up, lower > upper); ;; we need to make sure that lower is always less than upper
+
+  if (lower < 0) {
+    if (upper <= 0) {
+      below = upper - lower;
+    } else {
+      below = - lower;
+      above = upper;
+    }
+  } else {
+    above = upper - lower;
+  }
+  return (below, above);
+}
+
+(int, int) get_collateral_quote (
+  cell asset_config_collection,
+  int borrow_asset_id, int borrow_liquidate_amount,
+  int collateral_asset_id, cell prices_packed
+) {
+  int collateral_price = prices_packed.prices_packed:get?(collateral_asset_id);
+  if (collateral_price == -1) { return (-1, false); }
+  (_, int collateral_decimals, _, _, int liquidation_bonus, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(collateral_asset_id);
+
+  int borrow_price = prices_packed.prices_packed:get?(borrow_asset_id);
+  if (borrow_price == -1) { return (-1, false); }
+  int borrow_decimals = asset_config_collection.asset_config_collection:decimals(borrow_asset_id);
+
+  if (collateral_price == 0) { return (-1, true); }
+
+  return (muldiv(
+    borrow_price * borrow_liquidate_amount * fast_dec_pow(collateral_decimals),
+    liquidation_bonus,
+    constants::asset_coefficient_scale ;; ??? This coefficient
+  ) / collateral_price ;; used to be asset_price_discounted
+    / fast_dec_pow(borrow_decimals), true);
+}
+
+(int) is_valid_address?(slice address) inline {
+  ifnot (ext::addr_std_any_wc?(address)) {
+    return false;
+  }
+  return ext::is_on_same_workchain?(address);
+}
+
+(int) is_valid_custom_response_payload?(cell custom_response_payload) inline {
+  (_, _, _, int f?) = compute_data_size?(custom_response_payload, constants::custom_response_payload_max_cells);
+  return f?;
+}

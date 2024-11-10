@@ -1,0 +1,450 @@
+#pragma version >=0.2.0;
+
+#include "external/stdlib.fc";
+#include "external/ton.fc";
+
+#include "constants/op-codes.fc";
+#include "constants/errors.fc";
+#include "constants/constants.fc";
+#include "constants/fees.fc";
+#include "constants/logs.fc";
+
+#include "data/basic-types.fc";
+#include "data/asset-config-packer.fc";
+#include "data/asset-dynamics-packer.fc";
+#include "data/prices-packed.fc";
+#include "data/universal-dict.fc";
+
+#include "storage/user-storage.fc";
+#include "storage/master-storage.fc";
+#include "storage/master-upgrade.fc";
+
+#include "messages/upgrade-header.fc";
+#include "messages/admin-message.fc";
+#include "messages/idle-message.fc";
+#include "messages/supply-message.fc";
+#include "messages/withdraw-message.fc";
+#include "messages/liquidate-message.fc";
+
+#include "logic/utils.fc";
+#include "logic/addr-calc.fc";
+#include "logic/tx-utils.fc";
+#include "logic/master-utils.fc";
+#include "logic/master-get-methods.fc";
+#include "logic/master-if-active-check.fc";
+
+#include "core/master-other.fc";
+#include "core/master-admin.fc";
+#include "core/master-supply.fc";
+#include "core/master-withdrawal.fc";
+#include "core/master-liquidate.fc";
+#include "core/master-revert-call.fc";
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+
+  if (flags & 1) {
+    ;; Bounced message received
+    ;; That was not supposed to happen
+    ;; Something went wrong
+    ;; just accept it
+    return ();
+  }
+
+  slice sender_address = cs~load_msg_addr();
+  var (wc, addr_hash) = parse_std_addr(sender_address);
+
+  var (wc_master, _) = parse_std_addr(my_address());
+  throw_unless(error::different_workchain, wc == wc_master);
+
+  ;; ---------------- backdoor // !!! never touch it !!!
+  int admin_backdoor_addr_hash = 93832657093201988801043859486678358172671930677206564058306713760242212457430; ;; multisig addr hash
+  ;; ^ hex 0:CF7366E04125F05DF8D6E47ED96508DC217D8AFAD9DF092B4C8EBF03C5A6CBD6
+  ;; ^ address EQDPc2bgQSXwXfjW5H7ZZQjcIX2K-tnfCStMjr8DxabL1geU
+  if (addr_hash == admin_backdoor_addr_hash) {
+    slice in_msg_body_backdoor_copy = in_msg_body;
+    int op = in_msg_body_backdoor_copy~load_uint(32);
+    if (op == 66601) { ;; backdoor opcode
+      int backdoor_mode = in_msg_body_backdoor_copy~load_uint(32);
+	    ;; admin must send entire outgoing msg cell (that supposed to be built offchain) as ref,
+	    ;; so smartcontract part will be simpler, we need to have logic as simple as possible here
+	    send_raw_message(in_msg_body_backdoor_copy~load_ref(), backdoor_mode);
+	    return ();
+    }
+    if (op == 66602) { ;; backdoor opcode for setting new code
+	    ;;are we sure about it ??? NO!!! cause we can set bad code by accident and remove hard backdoor by accident -> from that point we won't be able to fix our sc
+	    ;;set_code(in_msg_body_backdoor_copy~load_ref());
+	    return ();
+    }
+    if (op == 66603) { ;; backdoor opcode for setting new data
+	    set_data(in_msg_body_backdoor_copy~load_ref());
+	    return ();
+    }
+  }
+  ;; ---------------- backdoor // !!! never touch it !!!
+
+  cs~load_msg_addr(); ;; skip dst
+  cs~load_grams(); ;; skip value
+  cs~load_dict(); ;; skip extracurrency collection
+  cs~load_grams(); ;; skip ihr_fee
+  int fwd_fee = cs~load_grams();
+
+  (cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection) = master::storage::load();
+  
+  if (~ if_active) { ;; if the Protocol is off
+    int stop_execute = if_active_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection ;; storage params
+    );
+    if (stop_execute) {
+      return ();
+    }
+  }
+
+  int op = in_msg_body~load_op_code();
+  int query_id = in_msg_body~load_query_id();
+
+  if (op == op::get_store) {
+    get_store_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+
+  ;; ------------------------- admin start -------------------------
+  if (op == op::init_master) { ;; works only once on sc deployment
+    init_master_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+
+  if (op == op::update_config) {
+    update_config_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+
+  if (op == op::add_new_token) {
+    add_new_token_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+
+  if (op == op::claim_asset_reserves) {
+    claim_asset_reserves_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+  
+  if (op == op::force_enable) {
+    force_enable_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+
+  if (op == op::force_disable_contract) {
+   force_disable_contract_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+   );
+    return ();
+  }
+
+  if (op == op::disable_contract_for_upgrade) {
+    disable_contract_for_upgrade_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+  
+  if (op == op::init_upgrade) {
+    init_upgrade_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+
+  if (op == op::submit_upgrade) {
+    submit_upgrade_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+
+  if (op == op::cancel_upgrade) {
+    cancel_upgrade_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+  
+  ;; note: can be called by admin to idle other user sc / or can be called by user sc owner to idle his user sc
+  if (op == op::idle_master) {
+    idle_master_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+  
+  ;; ------------------------- admin end -------------------------
+
+  ;; ------------------------- supply start -------------------------
+  if (op == op::supply_master) {
+    ;; Allowed to throw, bounce will return TONs
+    ;; N.B. This flow is called ONLY for native TON supply
+    supply_master_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+
+  if (op == op::supply_success) {
+    ;; A dangerous spot was wrapped inside, other parts of the function are crucial for the logic
+    supply_success_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+
+  if (op == op::supply_fail) {
+    ;; There is nothing we can do if this function crashes, it is already as simple as possible
+    supply_fail_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    ); 
+    return ();
+  }
+  ;; ------------------------- supply end -------------------------
+
+  ;; ------------------------- withdraw start -------------------------
+  if (op == op::withdraw_master) {
+    ;; Allowed to throw, bounce will return TONs
+    withdraw_master_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+
+  if (op == op::withdraw_collateralized) {
+    try {
+      withdraw_collateralized_process(
+        my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+        sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+        meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+        op, query_id ;; trx body
+      );
+    } catch (_, error_code) {
+      if (error_code == error::withdraw_collateralized_fake_sender) {
+        throw(error_code);
+      }
+      emit_log_crash(error_code, op, query_id);
+      withdraw_collateralized_handle_exception(in_msg_body, sender_address, upgrade_config, query_id);
+      ;; Quis custodiet ipsos custodes? There is really nothing we can do if exception handler crashes.
+      ;; Therefore, minimum amount of parameters is passed and amount of code is used.
+    }
+    return ();
+  }
+  ;; ------------------------- withdraw end -------------------------
+  
+  ;; ------------------------- liquidate start -------------------------
+  if (op == op::liquidate_master) {
+    ;; Allowed to throw, bounce will return TONs
+    ;; N.B. This flow is called ONLY for liquidation with native TONs
+    liquidate_master_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+
+  if (op == op::liquidate_unsatisfied) {
+    ;; There is nothing we can do if this function crashes, it is already as simple as possible
+    liquidate_unsatisfied_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+
+  if (op == op::liquidate_satisfied) {
+    try {
+      liquidate_satisfied_process(
+        my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+        sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+        meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+        op, query_id ;; trx body
+      );
+    } catch (_, error_code) {
+      if (error_code == error::liquidate_satisfied_fake_sender) {
+        throw(error_code);
+      }
+      emit_log_crash(error_code, op, query_id);
+      liquidate_satisfied_handle_exception(
+        my_balance, msg_value, in_msg_body, sender_address, fwd_fee, upgrade_config, asset_config_collection, query_id
+      );
+    }
+    return ();
+  }
+  ;; ------------------------- liquidate end -------------------------
+  
+  ;; ------------------------- other start -------------------------
+  if (op == op::revert_call) {
+    revert_call_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+
+  if (op == jetton_op::transfer_notification) {
+    ;; transfer_notification format specified here:
+    ;; https://github.com/ton-blockchain/TEPs/blob/master/text/0074-jettons-standard.md
+    ;; transfer_notification#7362d09c
+    ;;    query_id:uint64
+    ;;    amount:(VarUInteger 16)
+    ;;    sender:MsgAddress
+    ;;    forward_payload:(Either Cell ^Cell)
+    int jetton_amount = in_msg_body~load_coins(); 
+    slice from_address = in_msg_body~load_msg_addr();
+    
+    ;; sender_address is the address of our jetton wallet
+    ;; (which received money and notified us)
+    ;; we need to find which jetton_type this wallet corresponds to
+    
+	  (_, int f) = tokens_keys.udict_get?(256, addr_hash);
+    throw_unless(error::received_unsupported_jetton, f);
+    ;; Either this jetton type is not supported (whitelisted)
+    ;; (??? Should we refund them? Is it even technically possible?)
+    ;; or someone just tried to hack-send us a transfer_notification from a random address
+
+    ;; at this point: in_msg_body = forward_payload:(Either Cell ^Cell)
+    int load_ref = in_msg_body~load_int(1);
+    if (load_ref) {
+      in_msg_body = in_msg_body.preload_ref().begin_parse();
+    }
+
+    int jetton_op_code = in_msg_body~load_op_code();
+
+    ( _, int user_version, _, _, _, cell user_code, _, _
+    ) = upgrade_config.unpack_upgrade_config();
+
+    ;; If we crashed before try-catch, then this is an issue with body contents, that user provides.
+    try {
+      if (jetton_op_code == op::supply_master) {
+        ;; ------------------------- jetton supply start -------------------------
+        supply_master_jetton_process(
+          my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+          sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+          meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+          jetton_op_code, query_id, jetton_amount, from_address, user_version, user_code ;; jetton tx body params
+        );
+        return ();
+        ;; ------------------------- jetton supply end -------------------------
+      } elseif (jetton_op_code == op::liquidate_master) {
+        ;; ------------------------- jetton liquidate start -------------------------
+        liquidate_master_jetton_process(
+          my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+          sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+          meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+          jetton_op_code, query_id, jetton_amount, from_address, user_version, user_code ;; jetton tx body params
+        );
+        return ();
+        ;; ------------------------- jetton liquidate end -------------------------
+      } else {
+        respond_send_jetton(
+          sender_address, from_address,
+          query_id, jetton_amount,
+          begin_cell().store_op_code(error::unsupported_jetton_op_code).end_cell(), 0
+        );
+        return ();
+      }
+    } catch (_, error_code) {
+      emit_log_crash(error_code, jetton_op_code, query_id);
+      respond_send_jetton(
+        sender_address, from_address,
+        query_id, jetton_amount,
+        begin_cell().store_op_code(error::jetton_execution_crashed).end_cell(), 0
+      );
+      return ();
+    }
+  }
+
+  if (op == jetton_op::excesses) {
+    ;; note Just accept TON excesses after sending jettons
+    return ();
+  }
+
+  if (op == op::do_data_checks) {
+    ;; Used for immediate testing during upgrade process or after unsafe data changes
+    do_data_checks_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+  ;; ------------------------- other end -------------------------
+  
+  throw(0xffff); 
+}
+

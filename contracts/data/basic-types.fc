@@ -1,0 +1,104 @@
+#include "../external/stdlib.fc";
+
+(slice, int) load_op_code(slice cs) inline {
+	return cs.load_uint(32);
+}
+
+builder store_op_code(builder b, int op_code) inline {
+	return b.store_uint(op_code, 32);
+}
+
+;; ??? How to store prices?
+builder store_price(builder b, int price) inline {
+	return b.store_uint(price, 64);
+}
+
+(slice, int) load_price(slice cs) inline {
+	return cs.load_uint(64);
+}
+
+builder store_address_hash(builder b, int address_hash) inline {
+	return b.store_uint(address_hash, 256);
+}
+
+(slice, int) load_address_hash(slice cs) inline {
+	return cs.load_uint(256);
+}
+
+builder store_asset_id(builder b, int asset_id) inline {
+	return b.store_uint(asset_id, 256);
+}
+
+(slice, int) load_asset_id(slice cs) inline {
+	return cs.load_uint(256);
+}
+
+builder store_amount(builder b, int amount) inline {
+	;; I recommend to ensure that amount is non-negative here
+	return b.store_uint(amount, 64);
+	;; .load_amount is used in parse_liquidate_master_message
+	;; to store min_collateral_amount, which MUST be non-negative
+	;; (read the comment in parse_liquidate_master_message)
+	;; don't change to signed int
+	;; (or in case you need to - introduce necessary checks in the code)
+}
+
+(slice, int) load_amount(slice cs) inline {
+	return cs.load_uint(64);
+}
+
+builder store_balance(builder b, int balance) inline {
+	return b.store_uint(balance, 64);
+}
+
+(slice, int) load_balance(slice cs) inline {
+	return cs.load_uint(64);
+}
+
+;; ??? How to store s_rate and b_rate?
+builder store_sb_rate(builder b, int sb_rate) inline {
+	return b.store_uint(sb_rate, 64);
+}
+
+(slice, int) load_sb_rate(slice cs) inline {
+	return cs.load_uint(64);
+}
+
+;; ??? How to store principal amounts?
+;; (Note it at least can be negative)
+builder store_principal(builder b, int principal) inline {
+	return b.store_int(principal, 64);
+}
+
+(slice, int) load_principal(slice cs) inline {
+	return cs.load_int(64);
+}
+
+int preload_principal(slice cs) inline {
+	return cs.preload_int(64);
+}
+
+;; ??? Is timestamp always positive?
+builder store_timestamp(builder b, int timestamp) inline {
+	return b.store_uint(timestamp, 32);
+}
+
+(slice, int) load_timestamp(slice cs) inline {
+	return cs.load_uint(32);
+}
+
+(slice, int) load_bool_ext(slice cs) inline {
+	return cs.load_int(2);
+}
+
+builder store_tracking_index(builder b, int tracking_index) inline {
+	return b.store_uint(tracking_index, 64);
+}
+
+(slice, int) load_tracking_index(slice cs) inline {
+	return cs.load_uint(64);
+}
+
+(int) preload_tracking_index(slice cs) inline {
+	return cs.preload_uint(64);
+}

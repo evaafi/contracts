@@ -1,0 +1,105 @@
+#include "../external/stdlib.fc";
+#include "../constants/fees.fc";
+#include "../storage/user-storage.fc";
+#include "../messages/supply-message.fc";
+#include "../messages/withdraw-message.fc";
+#include "../logic/tx-utils.fc";
+#include "../logic/user-utils.fc";
+
+() supply_user_process (
+  slice sender_address, slice in_msg_body_original, int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; handle_transaction params
+  int code_version, slice master_address, slice owner_address, cell user_principals, int state, cell user_rewards, cell backup_cell_1, cell backup_cell_2, ;; user storage params
+  int op, int query_id ;; tx body params
+) impure inline {
+  (int asset_id, int supply_amount_current,
+    int s_rate, int b_rate,
+    int dust, int max_token_amount,
+    int total_supply, int total_borrow,
+    int tracking_supply_index, int tracking_borrow_index,
+    int forward_ton_amount, cell custom_response_payload) = parse_supply_user_message(in_msg_body);
+  
+  ;; state check
+  if (state != user_state::free) {
+    reserve_and_send_rest(
+      fee::min_tons_for_storage,
+      master_address,
+      pack_supply_fail_message(
+        query_id, owner_address,
+        asset_id, supply_amount_current,
+        forward_ton_amount, custom_response_payload
+      )
+    );
+    return ();
+  }
+
+  ;; ???? What if Supply happens during liquidation?
+  ;; What to do with received funds?
+
+  ;; set new principal
+  int old_principal = user_principals.get_principal(asset_id);
+  int present = present_value(s_rate, b_rate, old_principal);
+  present += supply_amount_current;
+  int new_principal = principal_value(s_rate, b_rate, present);
+  
+  if ((new_principal < dust) & (new_principal > 0)) { 
+    new_principal = 0;
+  }
+
+  (int repay_amount_principal,
+   int supply_amount_principal) = around_zero_split(old_principal, new_principal);
+
+  int new_total_supply = total_supply + supply_amount_principal;
+  int new_total_borrow = total_borrow - repay_amount_principal;
+
+  ;; max cap check and negative new total borrow check
+  if (((new_total_supply > max_token_amount) & (max_token_amount != 0) & (supply_amount_principal > 0)) | (new_total_borrow < 0)) {
+    reserve_and_send_rest(
+      fee::min_tons_for_storage,
+      master_address,
+      pack_supply_fail_message(
+        query_id, owner_address,
+        asset_id, supply_amount_current,
+        forward_ton_amount, custom_response_payload
+      )
+    );
+    return ();
+  }
+
+  user_principals~set_principal(asset_id, new_principal);
+
+  ;; rewards tracking
+  (int base_tracking_index, int base_tracking_accrued) = user_rewards.get_reward(asset_id);
+
+  (base_tracking_index, base_tracking_accrued) = accrue_user_indexes(base_tracking_index, base_tracking_accrued, tracking_supply_index, tracking_borrow_index, old_principal, new_principal);
+
+  user_rewards~set_reward(asset_id, base_tracking_index, base_tracking_accrued);
+
+  ;; success msg to master sc
+  reserve_and_send_rest(
+    fee::min_tons_for_storage,
+    master_address,
+    pack_supply_success_message(
+      query_id, owner_address,
+      asset_id, supply_amount_current, new_principal,
+      repay_amount_principal, supply_amount_principal, custom_response_payload
+    )
+  );
+
+  user::storage::save(code_version, master_address, owner_address, user_principals, state, user_rewards, backup_cell_1, backup_cell_2);
+  return ();
+}
+
+() supply_user_handle_exception (slice in_msg_body, slice master_address, slice owner_address, int query_id) impure inline {
+  (int asset_id, int supply_amount_current, _, _, _, _, _, _, _, _,
+    int forward_ton_amount, cell custom_response_payload) = parse_supply_user_message(in_msg_body);
+
+  reserve_and_send_rest(
+    fee::min_tons_for_storage,
+    master_address,
+    pack_supply_fail_message(
+      query_id, owner_address,
+      asset_id, supply_amount_current,
+      forward_ton_amount, custom_response_payload
+    )
+  );
+}

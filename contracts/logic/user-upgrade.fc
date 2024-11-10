@@ -1,0 +1,132 @@
+#include "../external/stdlib.fc";
+#include "../constants/errors.fc";
+#include "../constants/op-codes.fc";
+#include "../data/basic-types.fc";
+#include "../storage/user-storage.fc";
+#include "../storage/user-upgrade.fc";
+#include "../logic/tx-utils.fc";
+#include "user-revert-call.fc";
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure;
+
+(slice) on_upgrade(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure method_id (0x137) {
+  slice ds = get_data().begin_parse();
+  int code_version = ds~load_coins();
+  slice master_address = ds~load_msg_addr();
+  slice owner_address = ds~load_msg_addr();
+  cell user_principals = ds~load_dict();
+  int state = ds~load_int(64);
+  
+  if (ds.slice_empty?()) {
+    ;; means that user sc just deployed on blank
+    cell user_rewards = new_dict();
+    cell backup_cell_1 = null();
+    cell backup_cell_2 = null();
+    user::storage::save(
+      code_version,
+      master_address, owner_address,
+      user_principals, state, 
+      user_rewards, backup_cell_1, backup_cell_2
+    );
+  }
+
+  return in_msg_body;
+}
+
+
+(slice, int) upgrade_user_process (int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, slice sender_address, int addr_hash, int self_code_version, slice master_address, cell upgrade_info_cell, int expected_code_version, int upgrade_exec, slice ds, slice  in_msg_body_original) impure inline {
+  (
+    int code_version, slice master_address, slice owner_address, cell user_principals, int state, cell user_rewards, cell backup_cell_1, cell backup_cell_2
+  ) = user::storage::load();
+
+  ;; We need to check if the user is in free state before upgrading
+  if (state == user_state::free) {
+    try {
+      throw_if(error::broken_upgrade_info, upgrade_info_cell.null?());
+
+      ;; we need to pack it before set_c3
+      ;; so, universal_data is coming from old version of contract code (from current version for N+1 next versoin of the code)
+      cell universal_data = user::upgrade::pack_universal_storage_after_v6(master_address, owner_address, user_principals, state, user_rewards, backup_cell_1, backup_cell_2);
+
+      slice data_without_version = get_data().begin_parse();
+      data_without_version~skip_coins();
+      int old_data_hash = slice_hash(data_without_version);
+
+      slice upgrade_info = upgrade_info_cell.begin_parse();
+      throw_unless(error::broken_upgrade_info, upgrade_info.slice_refs() == 2);
+      cell new_code = upgrade_info~load_ref();
+      cell new_data = upgrade_info.preload_ref();
+
+      set_code(new_code);
+      ;; ***********************************************************************************************************************************************
+      set_c3(new_code.begin_parse().bless()); ;; ****************************************************************************************************
+      ;; ***********************************************************************************************************************************************
+
+      int allow_data_change = false;
+
+      ;; Code version can be either actual code version or 0 if the contract was just deployed
+      ;; Function calls are made after set_c3 and therefore pack - unpack cycle is useless here
+
+      {-
+        builder builded_store = begin_cell();
+
+        if (code_version == 0) {
+          ;; unpack_universal_storage suppose to support upacking universal_data that was packed in previous versions
+          builded_store = user::upgrade::unpack_universal_storage(
+            self_code_version, universal_data,
+            new_data
+          );
+          allow_data_change = true; ;; upgrade from v0 requires data structure change
+        }
+        elseif (code_version == 1) {
+          ;; unpack_universal_storage suppose to support upacking universal_data that was packed in previous versions
+          builded_store = user::upgrade::unpack_universal_storage_version_after_update(
+            self_code_version, universal_data,
+            new_data
+          );
+          allow_data_change = true; ;; upgrade from v1 requires data structure change
+        } 
+        else {
+          builded_store = begin_cell().store_slice(data_without_version);
+        }
+      -}
+
+      if (code_version == 0) {
+        ;; allow on_upgrade to process init data to actual format
+        allow_data_change = true;
+      }
+
+      set_data(
+        begin_cell()
+        .store_coins(expected_code_version)
+        .store_slice(data_without_version) ;; .store_builder(builded_store)
+        .end_cell()
+      );
+
+      ;; the call must at least upgrade init data to actual format
+      in_msg_body = on_upgrade(my_balance, msg_value, in_msg_full, in_msg_body);
+
+      ;; Run a quick and dirty test to make sure that the contract can route internal messages
+      recv_internal(my_balance, msg_value, in_msg_full,
+        begin_cell().user::upgrade::store_header(expected_code_version, null(), true)
+          .store_op_code(op::do_data_checks).store_query_id(0).end_cell().begin_parse()
+      );
+
+      ifnot (allow_data_change) {
+        slice new_data_without_version = get_data().begin_parse();
+        int new_code_version_for_check = new_data_without_version~load_coins();
+        int new_data_hash = slice_hash(new_data_without_version);
+
+        throw_unless(error::user_data_changed, new_code_version_for_check == expected_code_version);
+        throw_unless(error::user_data_changed, old_data_hash == new_data_hash);
+      }
+    } catch (_, _) {
+      slice owner_address = ds~load_msg_addr();
+      revert_call(sender_address, owner_address, in_msg_body_original);
+      return (in_msg_body, ret::stop_execution);
+    }
+  } else {
+    return (in_msg_body, ret::stop_execution); ;; state is not free -> stop
+  }
+  return (in_msg_body, ret::continue_execution);
+}

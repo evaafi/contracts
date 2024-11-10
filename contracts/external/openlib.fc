@@ -1,0 +1,13 @@
+;; cherry-picked from https://github.com/continuation-team/openlib.func/blob/main/openlib.func
+
+int     ext::addr_std?(slice addr) asm "b{10000000000} PUSHSLICE SDPPFXREV";
+
+int     ext::workchains_equal?(slice addr1, slice addr2) asm "REWRITESTDADDR DROP SWAP REWRITESTDADDR DROP EQUAL";
+int     ext::workchain_match?(slice addr, int wc) asm(wc addr) "REWRITESTDADDR DROP EQUAL";
+
+;; added by hand
+
+int ext::addr_std_any_wc?(slice addr) asm "b{100} PUSHSLICE SDPPFXREV";
+;; <<< addr_std$10 anycast:(Maybe Anycast) >>> workchain_id:int8 address:bits256 = MsgAddressInt;
+
+int ext::is_on_same_workchain?(slice addr) asm "REWRITESTDADDR DROP MYADDR REWRITESTDADDR DROP EQUAL";

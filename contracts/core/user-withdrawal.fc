@@ -1,0 +1,200 @@
+#include "../external/stdlib.fc";
+#include "../constants/fees.fc";
+#include "../constants/op-codes.fc";
+#include "../storage/user-storage.fc";
+#include "../messages/supply-message.fc";
+#include "../messages/withdraw-message.fc";
+#include "../logic/tx-utils.fc";
+#include "../logic/user-utils.fc";
+
+() withdraw_success_process (
+  slice sender_address, slice in_msg_body_original, int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; handle_transaction params
+  int code_version, slice master_address, slice owner_address, cell user_principals, int state, cell user_rewards, cell backup_cell_1, cell backup_cell_2, ;; user storage params
+  int op, int query_id ;; tx body params
+) impure inline {
+  (int asset_id, int principal_amount, int tracking_supply_index, int tracking_borrow_index) = parse_withdraw_success_message(in_msg_body);
+
+  (int base_tracking_index, int base_tracking_accrued) = user_rewards.get_reward(asset_id);
+
+  int new_principal = user_principals.get_principal(asset_id);
+  int old_principal = new_principal + principal_amount;
+
+  (base_tracking_index, base_tracking_accrued) = accrue_user_indexes(base_tracking_index, base_tracking_accrued, tracking_supply_index, tracking_borrow_index, old_principal, new_principal);
+
+  user_rewards~set_reward(asset_id, base_tracking_index, base_tracking_accrued);
+
+  try_reserve_and_send_rest(
+    fee::min_tons_for_storage,
+    owner_address, 
+    pack_withdraw_success_excess_message(
+      op::withdraw_success,
+      query_id
+    )
+  );
+
+  user::storage::save(code_version, master_address, owner_address, user_principals, user_state::free, user_rewards, backup_cell_1, backup_cell_2);
+  return ();
+}
+
+() withdraw_success_handle_exception (
+  int code_version, slice master_address, slice owner_address, cell user_principals, int state, cell user_rewards, cell backup_cell_1, cell backup_cell_2, int query_id
+) impure inline {
+  ;; The only possible problem is that something went wrong with rewards logic
+  ;; Need to unlock user and send success message regardless
+
+  try_reserve_and_send_rest(
+    fee::min_tons_for_storage,
+    owner_address,
+    pack_withdraw_success_excess_message(
+      op::withdraw_success,
+      query_id
+    )
+  );
+
+  user::storage::save(code_version, master_address, owner_address, user_principals, user_state::free, user_rewards, backup_cell_1, backup_cell_2);
+}
+
+() withdraw_fail_process (
+  slice sender_address, slice in_msg_body_original, int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; handle_transaction params
+  int code_version, slice master_address, slice owner_address, cell user_principals, int state, cell user_rewards, cell backup_cell_1, cell backup_cell_2, ;; user storage params
+  int op, int query_id ;; tx body params
+) impure inline {
+  (int asset_id, int principal_amount) = parse_withdraw_fail_message(in_msg_body);
+  int optimistic_principal = user_principals.get_principal(asset_id);
+  int reverted_principal = optimistic_principal + principal_amount; ;; withdraw failed - revert
+  user_principals~set_principal(asset_id, reverted_principal);
+  ;; Not enough funds - at least refund TON attachment to the owner
+  try_reserve_and_send_rest(
+    fee::min_tons_for_storage,
+    owner_address, 
+    pack_withdraw_excess_message(
+      op::withdraw_no_funds_excess,
+      query_id
+    )
+  );
+  ;; Update user_principals and Unlock
+  user::storage::save(code_version, master_address, owner_address, user_principals, user_state::free, user_rewards, backup_cell_1, backup_cell_2);
+  return ();
+}
+
+() withdraw_user_process (
+  slice sender_address, slice in_msg_body_original, int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; handle_transaction params
+  int code_version, slice master_address, slice owner_address, cell user_principals, int state, cell user_rewards, cell backup_cell_1, cell backup_cell_2, ;; user storage params
+  int op, int query_id ;; tx body params
+) impure inline {
+  if (state != user_state::free) {
+    ;; Refund TON attachment to the owner (and ignore the request in other respects)
+    try_reserve_and_send_rest(
+      fee::min_tons_for_storage,
+      owner_address, 
+      pack_withdraw_excess_message(
+        op::withdraw_locked_excess,
+        query_id
+      )
+    );
+    return ();
+  }
+
+  (int asset_id, int withdraw_amount_current,
+   int s_rate, int b_rate, slice recipient_address,
+   cell asset_config_collection, cell asset_dynamics_collection, cell prices_packed,
+   int forward_ton_amount, cell custom_response_payload
+   )
+   = parse_withdraw_user_message(in_msg_body);
+
+  (int jw_address_hash, int decimals, int collateral_factor,
+      int liquidation_threshold, _, int base_borrow_rate,
+      int borrow_rate_slope_low, int borrow_rate_slope_high, int supply_rate_slope_low,
+      int supply_rate_slope_high, int target_utilization, int origination_fee, int dust, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(asset_id);
+
+  int is_full_withdrawal = withdraw_amount_current == constants::max_uint64;
+  int old_principal = user_principals.get_principal(asset_id);
+  if (is_full_withdrawal){
+    (withdraw_amount_current, int enough_price_data) = calculate_maximum_withdraw_amount(
+      asset_config_collection, asset_dynamics_collection,
+      user_principals, prices_packed, asset_id, old_principal
+    );
+
+    if ((~ enough_price_data) | (withdraw_amount_current <= 0)) { ;; check that withdraw_amount_current is positive (we can have some edge cases where withdraw_amount_current will be calculated as 0 or even negative)
+      try_reserve_and_send_rest(
+        fee::min_tons_for_storage,
+        owner_address,
+        pack_withdraw_excess_message(
+          op::withdraw_missing_prices_excess,
+          query_id
+        )
+      );
+      return ();
+    }
+  }
+
+  int present = present_value(s_rate, b_rate, old_principal);
+  present -= withdraw_amount_current;
+
+  int new_principal = principal_value(s_rate, b_rate, present);
+
+  user_principals~set_principal(asset_id, new_principal);
+  ;; should check if any asset is in debt if not we don't need the rest of calculation and we can also ignore prices
+
+  (int borrow_is_collateralized, int enough_price_data) = is_borrow_collateralized(
+    asset_config_collection, asset_dynamics_collection,
+    user_principals, prices_packed
+  );
+
+  if (borrow_is_collateralized) { ;; we dont need to check enough_price_data here because borrow_is_collateralized var will be false if there is not enough price data & there is edge case where we dont need prices at all -> if there is no debt in user princpals
+    (int borrow_amount_principal, int reclaim_amount_principal)
+      = around_zero_split(new_principal, old_principal);
+    if (borrow_amount_principal > 0) { ;; note this will add origination_fee to borrow amount
+      ;; this might cause the borrow to be not collateralized but because it's very small and we already have a safe gap it's ok
+      int amount_to_borrow_in_present = - present_value(s_rate, b_rate, - borrow_amount_principal);
+      present -= amount_to_borrow_in_present.muldiv(origination_fee, constants::origination_fee_scale);
+      new_principal = principal_value(s_rate, b_rate, present);
+      
+      ;; now we need to recalculate borrow_amount_principal and reclaim_amount_principal after origination_fee
+      (borrow_amount_principal, reclaim_amount_principal)
+        = around_zero_split(new_principal, old_principal);
+    }
+
+    user_principals~set_principal(asset_id, new_principal);
+
+    reserve_and_send_rest(
+      fee::min_tons_for_storage,
+      master_address,
+      pack_withdraw_collateralized_message(
+        query_id,
+        owner_address, asset_id,
+        withdraw_amount_current, new_principal,
+        borrow_amount_principal, reclaim_amount_principal, recipient_address, 
+        forward_ton_amount, custom_response_payload
+      )
+    );
+    ;; Update user_principals and Lock contract
+    user::storage::save(code_version, master_address, owner_address, user_principals, user_state::withdrawing, user_rewards, backup_cell_1, backup_cell_2);
+    return ();
+  } else {
+    ;; Otherwise (borrow not collateralized) - refund TON attachment to the owner
+    ;; (and ignore the request in other respects)
+    try_reserve_and_send_rest(
+      fee::min_tons_for_storage,
+      owner_address, 
+      pack_withdraw_excess_message(
+        enough_price_data
+          ? op::withdraw_not_collateralized_excess
+          : op::withdraw_missing_prices_excess,
+        query_id
+      )
+    );
+    return ();
+  }
+}
+
+() withdraw_user_handle_exception(slice owner_address, int query_id) impure inline {
+  try_reserve_and_send_rest(
+    fee::min_tons_for_storage,
+    owner_address,
+    pack_withdraw_excess_message(
+      op::withdraw_execution_crashed,
+      query_id
+    )
+  );
+}

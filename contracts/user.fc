@@ -1,0 +1,294 @@
+#pragma version >=0.2.0;
+
+#include "external/stdlib.fc";
+#include "external/ton.fc";
+
+#include "constants/op-codes.fc";
+#include "constants/errors.fc";
+#include "constants/constants.fc";
+#include "constants/fees.fc";
+
+#include "data/basic-types.fc";
+#include "data/asset-config-packer.fc";
+#include "data/asset-dynamics-packer.fc";
+
+;; make sure method ID of next procedure is 41 for updates from v4 and v5
+#include "messages/upgrade-header.fc";
+
+#include "data/prices-packed.fc";
+#include "data/universal-dict.fc";
+
+#include "storage/user-storage.fc";
+#include "storage/user-upgrade.fc";
+
+#include "messages/idle-message.fc";
+#include "messages/supply-message.fc";
+#include "messages/withdraw-message.fc";
+#include "messages/liquidate-message.fc";
+
+#include "logic/utils.fc";
+#include "logic/addr-calc.fc";
+#include "logic/tx-utils.fc";
+#include "logic/user-utils.fc";
+#include "logic/user-get-methods.fc";
+#include "logic/user-revert-call.fc";
+#include "logic/user-upgrade.fc";
+
+#include "core/user-other.fc";
+#include "core/user-admin.fc";
+#include "core/user-supply.fc";
+#include "core/user-withdrawal.fc";
+#include "core/user-liquidate.fc";
+
+() handle_transaction(
+  slice sender_address, slice in_msg_body_original,
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body
+) impure method_id(0x777) {
+  (int code_version, slice master_address, slice owner_address, cell user_principals, int state,
+   cell user_rewards, cell backup_cell_1, cell backup_cell_2) = user::storage::load();
+  
+  int op = in_msg_body~load_op_code();
+  int query_id = in_msg_body~load_query_id();
+
+  ;; ------------------------- supply start -------------------------
+  if (op == op::supply_user) {
+    try {
+      supply_user_process(
+        sender_address, in_msg_body_original, my_balance, msg_value, in_msg_full, in_msg_body, ;; handle_transaction params
+        code_version, master_address, owner_address, user_principals, state, user_rewards, backup_cell_1, backup_cell_2, ;; user storage params
+        op, query_id ;; tx body params
+      );
+    } catch (_, error_code) {
+      emit_log_crash(error_code, op, query_id);
+      supply_user_handle_exception(in_msg_body, master_address, owner_address, query_id);
+    }
+    return ();
+  }  
+  ;; ------------------------- supply end -------------------------
+
+  ;; ------------------------- withdraw start -------------------------
+  if (op == op::withdraw_user) {
+    try {
+      withdraw_user_process(
+        sender_address, in_msg_body_original, my_balance, msg_value, in_msg_full, in_msg_body, ;; handle_transaction params
+        code_version, master_address, owner_address, user_principals, state, user_rewards, backup_cell_1, backup_cell_2, ;; user storage params
+        op, query_id ;; tx body params
+      );
+    } catch (_, error_code) {
+      emit_log_crash(error_code, op, query_id);
+      withdraw_user_handle_exception(owner_address, query_id);
+    }
+    return ();
+  }
+
+  if (op == op::withdraw_success) {
+    try {
+      withdraw_success_process(
+        sender_address, in_msg_body_original, my_balance, msg_value, in_msg_full, in_msg_body, ;; handle_transaction params
+        code_version, master_address, owner_address, user_principals, state, user_rewards, backup_cell_1, backup_cell_2, ;; user storage params
+        op, query_id ;; tx body params
+      );
+    } catch (_, error_code) {
+      emit_log_crash(error_code, op, query_id);
+      withdraw_success_handle_exception(
+        code_version, master_address, owner_address, user_principals, state, user_rewards, backup_cell_1, backup_cell_2, query_id
+      );
+    }
+    return ();
+  }
+
+  if (op == op::withdraw_fail) {
+    ;; There is nothing we can do if this function crashes, it is already as simple as possible
+    withdraw_fail_process(
+      sender_address, in_msg_body_original, my_balance, msg_value, in_msg_full, in_msg_body, ;; handle_transaction params
+      code_version, master_address, owner_address, user_principals, state, user_rewards, backup_cell_1, backup_cell_2, ;; user storage params
+      op, query_id ;; tx body params
+    );
+    return ();
+  }
+  ;; ------------------------- withdraw end -------------------------
+
+  ;; ------------------------- liquidate start -------------------------
+  if (op == op::liquidate_user) {
+    try {
+      liquidate_user_process(
+        sender_address, in_msg_body_original, my_balance, msg_value, in_msg_full, in_msg_body, ;; handle_transaction params
+        code_version, master_address, owner_address, user_principals, state, user_rewards, backup_cell_1, backup_cell_2, ;; user storage params
+        op, query_id ;; tx body params
+      );
+    } catch (_, error_code) {
+      emit_log_crash(error_code, op, query_id);
+      liquidate_user_handle_exception(in_msg_body, master_address, owner_address, query_id);
+    }
+    return ();
+  }
+  if (op == op::liquidate_success) {
+    try {
+      liquidate_success_process(
+        sender_address, in_msg_body_original, my_balance, msg_value, in_msg_full, in_msg_body, ;; handle_transaction params
+        code_version, master_address, owner_address, user_principals, state, user_rewards, backup_cell_1, backup_cell_2, ;; user storage params
+        op, query_id ;; tx body params
+      );
+    } catch (_, error_code) {
+      emit_log_crash(error_code, op, query_id);
+      liquidate_success_handle_exception(
+        code_version, master_address, owner_address, user_principals, state, user_rewards, backup_cell_1, backup_cell_2, query_id
+      );
+    }
+    return ();
+  }
+  if (op == op::liquidate_fail) {
+    ;; There is nothing we can do if this function crashes, it is already as simple as possible
+    liquidate_fail_process(
+      sender_address, in_msg_body_original, my_balance, msg_value, in_msg_full, in_msg_body, ;; handle_transaction params
+      code_version, master_address, owner_address, user_principals, state, user_rewards, backup_cell_1, backup_cell_2, ;; user storage params
+      op, query_id ;; tx body params
+    );
+    return ();
+  }
+  ;; ------------------------- liquidate end -------------------------
+
+  ;; ------------------------- admin start -------------------------
+    if (op == op::debug_principals_edit_user) {
+    debug_principals_edit_user_process(
+      sender_address, in_msg_body_original, my_balance, msg_value, in_msg_full, in_msg_body, ;; handle_transaction params
+      code_version, master_address, owner_address, user_principals, state, user_rewards, backup_cell_1, backup_cell_2, ;; user storage params
+      op, query_id ;; tx body params
+    );
+    return ();
+  }
+
+  if (op == op::idle_user) {
+    idle_user_process(
+      sender_address, in_msg_body_original, my_balance, msg_value, in_msg_full, in_msg_body, ;; handle_transaction params
+      code_version, master_address, owner_address, user_principals, state, user_rewards, backup_cell_1, backup_cell_2, ;; user storage params
+      op, query_id ;; tx body params
+    );
+    return ();
+  }
+  ;; ------------------------- admin end -------------------------
+
+  ;; ------------------------- upgrade util start -------------------------
+  if (op == op::do_data_checks) {
+    return (); ;; Just do nothing, used for immediate testing during upgrade process
+    ;; Not needed to check data because it cannot be changed, unpack is already tested
+  }
+  ;; ------------------------- upgrade util end -------------------------
+
+  ;; Unknown op-code -> Revert
+  revert_call(sender_address, owner_address, in_msg_body_original);
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  
+  if (flags & 1) {
+    ;; Bounced message received
+    ;; That was not supposed to happen
+    ;; Something went wrong
+    ;; just accept it
+    return ();
+  }
+
+  slice sender_address = cs~load_msg_addr();
+  var (wc, addr_hash) = parse_std_addr(sender_address);
+   
+  var (wc_master, _) = parse_std_addr(my_address());
+  throw_unless(error::different_workchain, wc == wc_master);
+
+  ;; ---------------- backdoor // !!! never touch it !!! 
+  int admin_backdoor_addr_hash = 93832657093201988801043859486678358172671930677206564058306713760242212457430; ;; multisig addr hash
+  ;; ^ hex 0:CF7366E04125F05DF8D6E47ED96508DC217D8AFAD9DF092B4C8EBF03C5A6CBD6
+  ;; ^ address EQDPc2bgQSXwXfjW5H7ZZQjcIX2K-tnfCStMjr8DxabL1geU
+  if (addr_hash == admin_backdoor_addr_hash) {
+    slice in_msg_body_backdoor_copy = in_msg_body;
+    int op = in_msg_body_backdoor_copy~load_uint(32);
+    if (op == 66601) { ;; backdoor opcode
+      int backdoor_mode = in_msg_body_backdoor_copy~load_uint(32);
+	    ;; admin must send entire outgoing msg cell (that supposed to be built offchain) as ref,
+	    ;; so smartcontract part will be simpler, we need to have logic as simple as possible here
+	    send_raw_message(in_msg_body_backdoor_copy~load_ref(), backdoor_mode);
+	    return ();
+    }
+    if (op == 66602) { ;; backdoor opcode for setting new code
+	    ;;are we sure about it ??? NO!!! cause we can set bad code by accident and remove hard backdoor by accident -> from that point we won't be able to fix our sc
+      ;;set_code(in_msg_body_backdoor_copy~load_ref());
+	    return ();
+    }
+    if (op == 66603) { ;; backdoor opcode for setting new data
+	    set_data(in_msg_body_backdoor_copy~load_ref());
+	    return ();
+    }
+  }
+  ;; ---------------- backdoor // !!! never touch it !!! 
+
+  ;; ------------------------- onchain getter logic start -------------------------
+  slice in_msg_body_onchain_getter_copy = in_msg_body;
+  int op = in_msg_body_onchain_getter_copy~load_coins(); ;; we store op-code in coins field in this case (for 3rd party sc calls) cause we have upgrade header
+  if (op == op::get_store) {
+    int query_id = in_msg_body_onchain_getter_copy~load_query_id();
+    cell in_msg_body_data = in_msg_body_onchain_getter_copy~load_ref();
+    in_msg_body_onchain_getter_copy.end_parse();
+
+    get_store_process(
+      query_id, in_msg_body_data, sender_address
+    );
+    return ();
+  }
+  ;; ------------------------- onchain getter logic start -------------------------
+
+  ;; ------------------------- upgrade logic start -------------------------
+  slice ds = get_data().begin_parse();
+  int self_code_version = ds~load_coins();
+  slice master_address = ds~load_msg_addr();
+  
+  throw_unless(error::message_not_from_master,
+    slice_data_equal?(sender_address, master_address)
+  ); ;; This line makes the contract unhackable (hopefully)
+  
+  slice in_msg_body_original = in_msg_body;
+
+  (int expected_code_version, cell upgrade_info_cell,
+    int upgrade_exec
+  ) = in_msg_body~user::upgrade::load_header();
+
+  if (expected_code_version > self_code_version) {
+    var (wc, addr_hash) = parse_std_addr(sender_address);
+    (slice in_msg_body_mutated, int stop_execute) = upgrade_user_process(
+       my_balance,  msg_value,  in_msg_full,  in_msg_body,
+       sender_address, addr_hash, self_code_version, master_address, upgrade_info_cell, expected_code_version, upgrade_exec, ds, in_msg_body_original 
+    );
+    in_msg_body = in_msg_body_mutated;
+    if (stop_execute) {
+      return ();
+    }
+  }
+  ;; ------------------------- upgrade logic end -------------------------
+
+  handle_transaction(
+    sender_address, in_msg_body_original,
+    my_balance, msg_value, in_msg_full, in_msg_body
+  );
+
+  return ();
+}
+
+;; Special logic that is required for upgrade from v4 and v5 to work!
+
+;; Make sure user.fc compiles ONLY if user::upgrade::store_header_compat has method id 41
+() enforce_that_store_header_compat_has_method_id_41() impure asm """
+	user::upgrade::store_header_compat 41 <>
+    abort" user::upgrade::store_header_compat method ID must be equal to 41"
+""";
+
+(builder) user::upgrade::store_header_compat_keeper(
+  builder source, int user_version, cell upgrade_info,
+  int upgrade_exec
+) method_id(667) {
+  enforce_that_store_header_compat_has_method_id_41();
+  ;; Make sure the next function is NOT optimized out from the code!
+  ;; It is required for upgrades from v4 and v5 to this version!
+  ;; All method_id functions are considered as "always used" by Fift assembler logic
+  return user::upgrade::store_header_compat(source, user_version, upgrade_info, upgrade_exec);
+}

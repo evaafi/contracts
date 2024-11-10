@@ -1,0 +1,44 @@
+#include "../external/stdlib.fc";
+#include "../external/ton.fc";
+#include "../constants/op-codes.fc";
+#include "../data/basic-types.fc";
+
+;; --------------- op::idle_master ---------------
+(slice) parse_idle_master_message(slice cs) {
+	slice target_address = cs~load_msg_addr(); ;; target_address
+	cs.end_parse();
+	
+	return (
+		target_address
+	);
+}
+
+;; --------------- op::idle_user ---------------
+cell pack_idle_user_message(
+	cell tokens_keys,
+  int query_id,
+	slice originator_address
+) {
+	return begin_cell()
+		.store_op_code(op::idle_user) ;; 32
+		.store_query_id(query_id)
+    	.store_dict(tokens_keys)
+		.store_slice(originator_address)
+		.end_cell();
+}
+
+(cell, slice) parse_idle_user_message(slice cs) {
+	return (
+		cs~load_dict(),
+    	cs~load_msg_addr()
+	);
+}
+
+;; --------------- op::idle_excess ---------------
+;; Idle excess message - refund extra TON attachment back to originator
+cell pack_idle_excess_message(int query_id) {
+	return begin_cell()
+		.store_op_code(op::idle_excess)
+		.store_query_id(query_id)
+		.end_cell();
+}

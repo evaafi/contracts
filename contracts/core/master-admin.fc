@@ -1,0 +1,689 @@
+#include "../constants/constants.fc";
+#include "../external/stdlib.fc";
+#include "../constants/errors.fc";
+#include "../constants/logs.fc";
+#include "../constants/op-codes.fc";
+#include "../data/asset-config-packer.fc";
+#include "../data/asset-dynamics-packer.fc";
+#include "../data/basic-types.fc";
+#include "../storage/master-storage.fc";
+#include "../messages/admin-message.fc";
+#include "../messages/idle-message.fc";
+#include "../logic/master-get-methods.fc";
+#include "../logic/master-utils.fc";
+#include "../logic/tx-utils.fc";
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure;
+
+() init_master_process (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+    throw_unless(error::message_not_from_admin, slice_data_equal?(sender_address, admin));
+    
+    ;; lets see if sc already initialized or not
+    slice ds = get_data().begin_parse();
+    ds~load_ref();
+    ds~load_ref();
+    ds~load_ref();
+    int is_dynamics_exist = ds~load_uint(1);
+    throw_unless(error::already_inited, is_dynamics_exist == 0); ;; if NOT empty -> trhow
+
+    cell new_asset_config_collection = in_msg_body~load_ref();
+    cell packed_data = in_msg_body~load_ref();
+    in_msg_body.end_parse();
+    slice unpacked_data = packed_data.begin_parse();
+    cell new_asset_dynamics_collection = unpacked_data~load_ref();
+    cell new_tokens_keys = unpacked_data~load_ref();
+    unpacked_data.end_parse();
+    master::storage::save(meta, upgrade_config, new_asset_config_collection, if_active, oracles_info, admin, new_tokens_keys, new_asset_dynamics_collection);
+    return ();
+}
+
+() update_config_process (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+    throw_unless(error::message_not_from_admin, slice_data_equal?(sender_address, admin));
+    cell new_meta = in_msg_body~load_ref();
+    cell new_config = in_msg_body~load_ref();
+    in_msg_body.end_parse();
+
+    cell old_store = get_data();
+
+    cell new_assets_dynamics_collection = update_master_lm_indexes(asset_config_collection, asset_dynamics_collection);
+
+    cell new_store = begin_cell()
+      .store_ref(new_meta)
+      .store_ref(upgrade_config)
+      .store_ref(new_config)
+      .store_dict(new_assets_dynamics_collection)
+      .end_cell();
+
+    cell log_data = begin_cell()
+      .store_uint(log::update_config, 8)
+      .store_uint(now(), 32) 
+      .store_ref(old_store)
+      .store_ref(new_store)
+      .end_cell();
+
+    emit_log_simple(log_data);
+
+    set_data(new_store);
+
+    recv_internal(my_balance, msg_value, in_msg_full,
+        begin_cell().store_op_code(op::do_data_checks).store_query_id(query_id).end_cell().begin_parse()
+    );
+
+    return ();
+}
+
+() claim_asset_reserves_process (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+    ;; Check it's devs who want dev money
+    throw_unless(
+      error::claim_asset_reserves_not_admin,
+      slice_data_equal?(sender_address, admin)
+    );
+
+    ;; Check enough attached TON
+    int enough_fee = claim_asset_reserves_min_attachment(fwd_fee);
+    throw_unless(
+      error::claim_asset_reserves_transaction_fees,
+      msg_value >= enough_fee
+    );
+    msg_value -= fee::claim_asset_reserves;
+    msg_value -= fee::log_tx;
+
+    (slice target_address, int asset_id, int amount_to_claim)
+      = parse_claim_asset_reserves_message(in_msg_body);
+    {
+      ( _, _,
+       int total_supply_principal, int total_borrow_principal,
+       int last_accrual, int token_balance, int tracking_supply_index, int tracking_borrow_index,
+       int awaited_supply
+      )
+        = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+
+      (int s_rate, int b_rate) = get_current_rates(
+        asset_config_collection, asset_dynamics_collection,
+        asset_id,
+        now() - last_accrual 
+      );
+
+      ;; Update tracking indexes
+      (
+          int jw_address_hash, int decimals, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+          int min_principal_for_rewards , int base_tracking_supply_speed, int base_tracking_borrow_speed
+      ) = asset_config_collection.asset_config_collection:get_unpacked(asset_id);
+
+      (tracking_supply_index, tracking_borrow_index) = accrue_tracking_indexes(
+          tracking_supply_index, tracking_borrow_index, last_accrual,
+          total_supply_principal, total_borrow_principal, decimals,
+          min_principal_for_rewards, ;; < note we need to accrue interests on OLD totals.
+          ;; ^ so, total_supply_principal and total_borrow_principal NOT new_total_supply and new_total_borrow.
+          ;; ^ because we need to calculate rewards for the period from last_accrual_timestamp to now
+          base_tracking_supply_speed, base_tracking_borrow_speed);
+
+      throw_if(error::claim_asset_reserves_not_enough, amount_to_claim > token_balance);
+      ;; Even devs can't get their money sometimes
+      int asset_reserves = get_asset_reserves_direct(
+        token_balance,
+        s_rate, total_supply_principal,
+        b_rate, total_borrow_principal
+      );
+      throw_if(error::claim_asset_reserves_too_much, amount_to_claim > asset_reserves);
+      ;; Sketchy developers want to claim too much money
+      ;; Of course we wouldn't do it, but this ^ line is just for you to be sure
+
+      ;; Note there are two checks for "enough asset" above
+      ;; Only one check would not be enough, because both situations are possible:
+      ;; 1) There is a lot of asset balance (someone made a big Supply), but we/devs didn't earn enough yet
+      ;; 2) Our earnings are substantial, but the factually available asset balance is low. For example:
+      ;; one person Supplied $10 000, another - Borrowed $10 000, then some time passed and interest accumulated
+
+      cell log_data = begin_cell()
+        .store_uint(log::claim_asset_reserves, 8)
+        .store_uint(now(), 32) 
+        .store_slice(target_address)
+        .store_asset_id(asset_id)
+        .store_amount(amount_to_claim)
+        .store_balance(token_balance - amount_to_claim)
+        .end_cell();
+
+      emit_log_simple(log_data);
+
+      if (asset_id == constants::ton_asset_id){
+        raw_reserve(my_balance - amount_to_claim - msg_value, reserve::REGULAR);
+      } else {
+        raw_reserve(0, 4);
+      }
+
+      send_asset_ext(
+        target_address, query_id,
+        jw_address_hash, amount_to_claim,
+        0,
+        begin_cell().end_cell(),
+        sendmode::CARRY_ALL_BALANCE 
+      );
+
+      asset_dynamics_collection~asset_dynamics_collection:set_packed(
+        asset_id, 
+        s_rate, b_rate, ;; These are NEW (not unpacked) computed values
+        total_supply_principal,
+        total_borrow_principal,
+        now(), ;; last_accrual updated because s_rate and b_rate are new
+        token_balance - amount_to_claim, ;; Update balance
+        tracking_supply_index, tracking_borrow_index,
+        awaited_supply
+      );
+    }
+
+    master::storage::save(
+      meta, upgrade_config,
+      asset_config_collection, 
+      if_active, oracles_info, admin, tokens_keys,
+      asset_dynamics_collection
+    );
+
+   return ();
+}
+
+() force_enable_process  (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+    throw_unless(error::message_not_from_admin, slice_data_equal?(sender_address, admin));
+    ;; enable = -1
+
+    cell log_data = begin_cell()
+      .store_uint(log::enable, 8)
+      .store_uint(now(), 32) 
+      .end_cell();
+    emit_log_simple(log_data);
+
+    master::storage::save(
+      meta, upgrade_config,
+      asset_config_collection, 
+      -1, oracles_info, admin, tokens_keys,
+      asset_dynamics_collection
+    );
+   return ();
+}
+
+() force_disable_contract_process (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+    throw_unless(error::message_not_from_admin, slice_data_equal?(sender_address, admin));
+    ;; just set 0 (flase) to is_active
+    
+    cell log_data = begin_cell()
+      .store_uint(log::disable, 8)
+      .store_uint(now(), 32) 
+      .end_cell();
+    emit_log_simple(log_data);
+    
+    master::storage::save(
+      meta, upgrade_config,
+      asset_config_collection, 
+      0, oracles_info, admin, tokens_keys,
+      asset_dynamics_collection
+    );
+   return ();
+}
+
+() disable_contract_for_upgrade_process  (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+    throw_unless(error::message_not_from_admin, slice_data_equal?(sender_address, admin));
+    (
+      int master_version, int user_version,
+      int timeout, int update_time, int freeze_time,
+      cell user_code,
+      cell new_master_code, cell new_user_code
+    ) = unpack_upgrade_config(upgrade_config);
+
+    cell new_upgrade_config = pack_upgrade_config(
+      master_version, user_version,
+      timeout, update_time, now(),
+      user_code,
+      new_master_code, new_user_code
+    );
+
+    cell log_data = begin_cell()
+      .store_uint(log::disable_for_upgrade, 8)
+      .store_uint(now(), 32) 
+      .store_ref(upgrade_config)
+      .store_ref(new_upgrade_config)
+      .end_cell();
+    emit_log_simple(log_data);
+
+    master::storage::save(
+      meta, new_upgrade_config,
+      asset_config_collection, 
+      0, oracles_info, admin, tokens_keys,
+      asset_dynamics_collection
+    );
+   return ();
+}
+
+() init_upgrade_process  (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+    throw_unless(error::message_not_from_admin, slice_data_equal?(sender_address, admin));
+    (
+      int master_version, int user_version,
+      int timeout, int update_time, int freeze_time,
+      cell user_code,
+      cell new_master_code, cell new_user_code
+    ) = unpack_upgrade_config(upgrade_config);
+    cell new_master_code = in_msg_body~load_maybe_ref();
+    cell new_user_code = in_msg_body~load_maybe_ref();
+    in_msg_body.end_parse();
+    int ts = now();
+    cell new_upgrade_config = pack_upgrade_config(
+      master_version, user_version,
+      timeout, ts + timeout, 0,
+      user_code,
+      new_master_code, new_user_code
+    );
+
+    cell log_data = begin_cell()
+      .store_uint(log::init_upgrade, 8)
+      .store_uint(now(), 32) 
+      .store_ref(upgrade_config)
+      .store_ref(new_upgrade_config)
+      .end_cell();
+    emit_log_simple(log_data);
+
+    master::storage::save(
+      meta, new_upgrade_config,
+      asset_config_collection, 
+      if_active, oracles_info, admin, tokens_keys,
+      asset_dynamics_collection
+    );
+   return ();
+}
+
+(slice) on_upgrade(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure method_id (0x137) {
+  slice ds = get_data().begin_parse();
+  cell meta = ds~load_ref();
+  cell upgrade_config = ds~load_ref();
+  cell marketConfig = ds~load_ref();
+  slice unpacked_marked_config = marketConfig.begin_parse();
+  cell asset_config_collection = unpacked_marked_config~load_dict();
+  int if_active = unpacked_marked_config~load_int(8);
+  slice admin = unpacked_marked_config~load_msg_addr();
+  ;; Note Replace after upgrade with load of oracle_info
+  int admin_pk = unpacked_marked_config~load_uint(256); ;; prev version
+  cell tokens_keys = unpacked_marked_config~load_dict();
+  cell wallet_to_master = unpacked_marked_config~load_dict(); ;; rm on next update
+  cell asset_dynamics_collection = ds~load_dict();
+
+  ;; Note rm after upgrade
+  slice oracles_info = in_msg_body~load_bits_refs(33, 1);
+
+  cell new_asssets_config = new_dict();
+  (int asset_id, slice asset_config, int flag) = asset_config_collection.udict_get_min?(256);
+  while (flag) {
+	  int jw_address_hash = asset_config~load_uint(256); 
+	  int decimals = asset_config~load_uint(8);
+	  
+	  cell asset_config_params_packed = asset_config~load_ref();
+	  slice asset_config_params = asset_config_params_packed.begin_parse();
+
+	  int collateral_factor = asset_config_params~load_uint(16);
+	  int liquidation_threshold = asset_config_params~load_uint(16);
+	  int liquidation_bonus = asset_config_params~load_uint(16);
+	  int base_borrow_rate = asset_config_params~load_uint(64); 
+	  int borrow_rate_slope_low = asset_config_params~load_uint(64); 
+	  int borrow_rate_slope_high = asset_config_params~load_uint(64);
+	  int supply_rate_slope_low = asset_config_params~load_uint(64); 
+	  int supply_rate_slope_high = asset_config_params~load_uint(64);
+	  int target_utilization = asset_config_params~load_uint(64);
+	  int origination_fee = asset_config_params~load_uint(64);
+	  int dust = asset_config_params~load_uint(64);
+	  int max_total_supply = asset_config_params~load_uint(64);
+	  int reserve_factor = asset_config_params~load_uint(16);
+	  int liquidation_reserve_factor = asset_config_params~load_uint(16);
+    
+    ;; Note Replace after upgrade with proper loads!
+	  int min_principal_for_rewards = 0; 
+	  int base_tracking_supply_speed = 0; 
+	  int base_tracking_borrow_speed = 0; 
+
+    cell packed_config = pack_asset_config(
+		  jw_address_hash, decimals,
+		  collateral_factor,
+		  liquidation_threshold, liquidation_bonus,
+		  base_borrow_rate, borrow_rate_slope_low,
+		  borrow_rate_slope_high, supply_rate_slope_low,
+		  supply_rate_slope_high, target_utilization,
+      origination_fee, dust,
+      max_total_supply,
+      reserve_factor, liquidation_reserve_factor,
+      min_principal_for_rewards, base_tracking_supply_speed,
+      base_tracking_borrow_speed
+    );
+
+    new_asssets_config~udict_set(256, asset_id, 
+      packed_config.begin_parse()
+    );
+
+    (asset_id, asset_config, flag) =  asset_config_collection.udict_get_next?(256, asset_id);
+  }
+
+    cell new_asset_dynamics_collection = new_dict();
+
+    {
+        (int asset_id, slice asset_dynamics, int flag) = asset_dynamics_collection.udict_get_min?(256);
+        while (flag) {
+            int asset_s_rate = asset_dynamics~load_sb_rate();
+            int asset_b_rate = asset_dynamics~load_sb_rate();
+            int total_supply_principal = asset_dynamics~load_principal();
+            int total_borrow_principal = asset_dynamics~load_principal();
+            int last_accrual = asset_dynamics~load_timestamp();
+            int token_balance = asset_dynamics~load_balance();
+
+            int tracking_supply_index = 0;
+            int tracking_borrow_index = 0;
+            int awaited_supply = 0;
+
+            cell asset_dynamics_new = pack_asset_dynamics(
+                asset_s_rate, asset_b_rate,
+                total_supply_principal, total_borrow_principal,
+                last_accrual, token_balance,
+                tracking_supply_index, tracking_borrow_index,
+                awaited_supply
+            );
+
+            new_asset_dynamics_collection~udict_set(256, asset_id, asset_dynamics_new.begin_parse());
+
+            (asset_id, asset_dynamics, flag) = asset_dynamics_collection.udict_get_next?(256, asset_id);
+        }
+    }
+
+  master::storage::save(
+    meta, upgrade_config,
+    new_asssets_config, 
+    if_active, oracles_info, admin, tokens_keys,
+    new_asset_dynamics_collection
+  );
+
+  return in_msg_body;
+}
+
+() submit_upgrade_process  (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+    throw_unless(error::message_not_from_admin, slice_data_equal?(sender_address, admin));
+    (
+      int master_version, int user_version,
+      int timeout, int update_time, int freeze_time,
+      cell user_code,
+      cell new_master_code, cell new_user_code
+    ) = unpack_upgrade_config(upgrade_config);
+    throw_if(error::upgrade_not_allowed_new_code_is_empty, new_master_code.null?() & new_user_code.null?());
+    throw_unless(error::upgrade_not_allowed_too_early_update, now() > update_time);
+    throw_if(error::upgrade_not_allowed_freeze_too_short, freeze_time < 1);
+    throw_unless(error::upgrade_not_allowed_too_early_freeze, (now() - freeze_time) > constants::upgrade_freeze_time);
+    ifnot (new_master_code.null?()) {
+      master_version += 1;
+    }
+    ifnot (new_user_code.null?()) {
+      user_version += 1;
+      user_code = new_user_code;
+    }
+    cell new_upgrade_config = pack_upgrade_config(
+      master_version, user_version,
+      timeout, 0, 0,
+      user_code,
+      null(), null()
+    );
+    cell universal_data = master::upgrade::pack_universal_storage(
+      meta, new_upgrade_config,
+      asset_config_collection,
+      if_active, oracles_info, admin, tokens_keys,
+      asset_dynamics_collection
+    );
+
+    cell old_code = get_code();
+    cell old_store = get_data();
+
+    ifnot (new_master_code.null?()) {
+      set_code(new_master_code);
+      set_c3(new_master_code.begin_parse().bless());
+    }
+    
+    set_data(master::upgrade::unpack_universal_storage(universal_data));
+
+    on_upgrade(my_balance, msg_value, in_msg_full, in_msg_body);
+    
+    cell new_store = get_data();
+
+    cell log_data = begin_cell()
+      .store_uint(log::submit_upgrade, 8)
+      .store_uint(now(), 32) 
+      .store_ref(begin_cell()
+          .store_ref(upgrade_config)
+          .store_ref(old_code)
+          .store_ref(old_store)
+        .end_cell())
+      .store_ref(begin_cell()
+          .store_ref(new_upgrade_config)
+          .store_ref(new_master_code)
+          .store_ref(new_store)
+        .end_cell())
+      .end_cell();
+    emit_log_simple(log_data);
+
+    recv_internal(my_balance, msg_value, in_msg_full,
+      begin_cell().store_op_code(op::do_data_checks).store_query_id(query_id).end_cell().begin_parse()
+    );
+    return ();
+}
+
+() cancel_upgrade_process  (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+    throw_unless(error::message_not_from_admin, slice_data_equal?(sender_address, admin));
+    (
+      int master_version, int user_version,
+      int timeout, int update_time, int freeze_time,
+      cell user_code,
+      cell new_master_code, cell new_user_code
+    ) = unpack_upgrade_config(upgrade_config);
+    cell new_upgrade_config = pack_upgrade_config(
+      master_version, user_version,
+      timeout, 0, 0,
+      user_code,
+      null(), null()
+    );
+    
+    cell log_data = begin_cell()
+      .store_uint(log::cancel_upgrade, 8)
+      .store_uint(now(), 32) 
+      .store_ref(upgrade_config)
+      .store_ref(new_upgrade_config)
+      .end_cell();
+    emit_log_simple(log_data);
+
+    master::storage::save(
+      meta, new_upgrade_config,
+      asset_config_collection, 
+      -1, oracles_info, admin, tokens_keys, ;; note r we shure that we can force set -1 (as is_active) here ?
+      asset_dynamics_collection
+    );
+   return ();
+}
+
+() idle_master_process  (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+    slice target_address = parse_idle_master_message(in_msg_body);
+    throw_unless(
+      error::idle_target_not_allowed,
+      slice_data_equal?(sender_address, admin)
+      | slice_data_equal?(sender_address, target_address)
+    );
+    ;; ^ Strictly speaking, I don't immediately see a problem with:
+    ;; allowing any address to idle any other address, but ...
+    ;; better be safe than sorry
+    ;; The most likely problem I can imagine being somehow possible is:
+    ;; DDoSing User contract and slowly draining its balance
+
+    ( _, int user_version, _, _, _, cell user_code, _, _
+    ) = upgrade_config.unpack_upgrade_config();
+
+    ;; The only real reason to idle, is to upgrade User contract
+    ;; that is why it only makes sense to attach user_code
+    ;; (unlike with Supply, where sending op::supply_user without attaching user_code makes sense in most cases)
+    send_message_to_lending_wallet(
+      BLANK_CODE(), user_version, user_code, target_address,
+      pack_idle_user_message(
+        tokens_keys,
+        query_id,
+        sender_address
+      ),
+      sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
+    );
+   return ();
+}
+
+() add_new_token_process(
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+  throw_unless(error::message_not_from_admin, slice_data_equal?(sender_address, admin));
+  int asset_key = in_msg_body~load_uint(256);
+  cell new_asset_config = in_msg_body~load_ref();
+  cell new_asset_dynamics = in_msg_body~load_ref();
+  in_msg_body.end_parse();
+
+  (_, int flag1) = asset_config_collection~udict_set_get?(256, asset_key, new_asset_config.begin_parse());
+  (_, int flag2) = asset_dynamics_collection~udict_set_get?(256, asset_key, new_asset_dynamics.begin_parse());
+  throw_if(error::already_exists, flag1 | flag2);
+
+  cell log_data = begin_cell()
+    .store_uint(log::add_new_token, 8)
+    .store_uint(now(), 32)
+    .store_ref(new_asset_config)
+    .store_ref(new_asset_dynamics)
+    .store_ref(asset_config_collection)
+    .store_ref(asset_dynamics_collection)
+    .end_cell();
+  emit_log_simple(log_data);
+
+  master::storage::save(
+    meta, upgrade_config,
+    asset_config_collection, 
+    if_active, oracles_info, admin, tokens_keys,
+    asset_dynamics_collection
+  );
+
+  ;; Add token is a pretty rare operation, can afford performing the full check
+  ;; Must be done after storage is updated!
+  recv_internal(my_balance, msg_value, in_msg_full,
+      begin_cell().store_op_code(op::do_data_checks).store_query_id(query_id).end_cell().begin_parse()
+  );
+
+  return ();
+}
+
+() do_data_checks_process (
+    int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+    slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+    cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+    int op, int query_id ;; trx body
+) impure inline {
+    (
+        int master_code_version, int user_code_version,
+        int timeout, int update_time, int freeze_time,
+        cell user_code,
+        cell new_master_code, cell new_user_code
+    ) = upgrade_config.unpack_upgrade_config();
+    throw_unless(error::invalid_data + 0x1, is_valid_address?(admin));
+
+    ;; Make sure total_oracles, threshold > 0, threshold <= total_oracles, and oracles is present
+    int total_oracles = oracles_info~load_uint(16);
+    int threshold = oracles_info~load_uint(16);
+    int oracles_present = oracles_info~load_uint(1);
+    throw_unless(error::invalid_data + 0x2, total_oracles != 0);
+    throw_unless(error::invalid_data + 0x3, threshold != 0);
+    throw_unless(error::invalid_data + 0x4, threshold <= total_oracles);
+    throw_unless(error::invalid_data + 0x5, oracles_present);
+
+    ;; Check for TON entry presence in config
+    (_, int flag) = asset_config_collection.udict_get?(256, constants::ton_asset_id);
+    throw_unless(error::invalid_data + 0x6, flag);
+
+    ;; Check that every entry present in config is also present in dynamics, and both can be parsed
+    (int asset_id, slice asset_config, int flag) = asset_config_collection.udict_get_min?(256);
+    throw_unless(error::invalid_data + 0x7, flag);
+    while (flag) {
+        (slice asset_dynamics, int dyn_flag) = asset_dynamics_collection.udict_get?(256, asset_id);
+        throw_unless(error::invalid_data + 0x8, dyn_flag);
+
+        (
+            int jw_address_hash, int decimals,
+            int collateral_factor, int liquidation_threshold,
+            int liquidation_bonus, int base_borrow_rate,
+            int borrow_rate_slope_low, int borrow_rate_slope_high,
+            int supply_rate_slope_low, int supply_rate_slope_high,
+            int target_utilization, int origination_fee,
+            int dust_value, int max_total_supply,
+            int reserve_factor, int liquidation_reserve_factor,
+            int min_principal_for_rewards, int base_tracking_supply_speed,
+            int base_tracking_borrow_speed
+        ) = asset_config.unpack_asset_config();
+
+        throw_unless(error::invalid_data + 0x9, (0 <= collateral_factor) &
+            (collateral_factor <= liquidation_threshold) & (liquidation_threshold <= 10000));
+        throw_unless(error::invalid_data + 0xA, (liquidation_bonus >= 10000));
+        throw_unless(error::invalid_data + 0xB, (liquidation_reserve_factor <= constants::reserve_liquidation_scale));
+        throw_unless(error::invalid_data + 0xC, (reserve_factor <= constants::reserve_scale));
+
+        throw_unless(error::invalid_data + 0xD, (origination_fee <= constants::origination_fee_scale));
+
+        (
+            int asset_s_rate, int asset_b_rate,
+            int total_supply_principal, int total_borrow_principal,
+            int last_accrual, int token_balance,
+            int tracking_supply_index, int tracking_borrow_index,
+            int awaited_supply
+        ) = asset_dynamics.unpack_asset_dynamics();
+
+        (asset_id, asset_config, flag) = asset_config_collection.udict_get_next?(256, asset_id);
+    }
+    return ();
+}

@@ -1,0 +1,582 @@
+#include "../constants/constants.fc";
+#include "../external/stdlib.fc";
+#include "../constants/errors.fc";
+#include "../constants/logs.fc";
+#include "../data/basic-types.fc";
+#include "../messages/liquidate-message.fc";
+#include "../logic/addr-calc.fc";
+#include "../logic/master-get-methods.fc";
+#include "../logic/tx-utils.fc";
+#include "../logic/utils.fc";
+
+cell master_core_logic_liquidate_asset_unchecked(
+  int user_version, cell user_code, int query_id,
+  cell asset_config_collection, cell asset_dynamics_collection,
+  slice borrower_address,
+  int collateral_asset_id, int min_collateral_amount,
+  slice liquidator_address,
+  int transferred_asset_id, int transferred_amount,
+  int TON_reserve_amount, 
+  int forward_ton_amount, cell custom_response_payload,
+  cell prices_packed,
+  int fwd_fee, int msg_value
+) impure {
+  (_, _, _, _, _, int token_balance, _, _, _) =
+    asset_dynamics_collection.asset_dynamics_collection:get_unpacked(collateral_asset_id);
+
+  asset_dynamics_collection~update_old_rates_and_provided_asset_id(
+    asset_config_collection, collateral_asset_id, transferred_asset_id
+  );
+
+  ;; ----- Check: don't liquidate too much -----
+  ;; I was thinking if we can calculate collateral_amount here on master, but looks like "no" because we don't know user's loan_present (of the transferred_asset_id).
+  ;; Or we'd have to either:
+  ;; a) strict-reject liquidation (on User) if user doesn't have enough loan_present (instead of soft-accepting it with lower liquidatable_amount)
+  ;; b) use the value calculated on master for checking that the liquidation doesn't liquidate too much of master's assets and (in case loan_present is < transferred_amount) recalculate get_collateral_quote
+  ;;NOTE if we want to set liquidity as supply - borrow then uncomment here
+  ;;int collateral_liquidity = get_asset_liquidity(
+  ;;  total_supply_principal, total_borrow_principal,
+  ;;  s_rate, b_rate
+  ;;);
+  int collateral_liquidity = token_balance;
+
+  int max_allowed_liquidation = muldiv(collateral_liquidity, 3, 4);
+  ;; Specific comparison below with 3/4th is a bit arbitrary
+  if (min_collateral_amount > max_allowed_liquidation) {
+    ;; Liquidating too much of our liquidity at once
+    ;; This is not allowed, because there is a higher chance that after getting a liquidation-approval from the User smart contract (and corresponding locking of funds there), the 3rd and the final phase of checks (on the Master: is there enough liquidity) will fail causing the liquidation failure and "revert".
+    ;; The bad part is that after 2nd phase of checks (on the User) funds there get temporarily locked and become unavailable for further liquidation -> thus making it (theoretically?) possible to prevent liquidation of the specific Owner by spamming large liquidation requests.
+    ;; Check with min_collateral_amount (instead of final collateral_amount) is not "directly" bulletproof: hacker may set low min_collateral_amount, but that would risk a lot of his funds because of all soft-checks that allow liquidation to proceed as long as min_collateral_amount is satisfied.
+
+    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _
+    ) = asset_config_collection.asset_config_collection:get_unpacked(transferred_asset_id);
+
+    ;; Refund asset
+    immediate_asset_refund(
+      liquidator_address,
+      query_id,
+      jw_address_hash, transferred_amount, 
+      pack_liquidation_fail_report_message(
+        build_master_liquidating_too_much_error(max_allowed_liquidation),
+        custom_response_payload
+      ), forward_ton_amount
+    );
+
+    ;; Note that we don't break execution:
+    ;; We update asset_dynamics_collection with new s/b-rates regardless
+  } else {
+    raw_reserve(TON_reserve_amount, reserve::AT_MOST + 2);
+
+    cell liquidate_user_message = pack_liquidate_user_message(
+      query_id,
+      asset_config_collection, asset_dynamics_collection,
+      collateral_asset_id, min_collateral_amount,
+      liquidator_address,
+      transferred_asset_id, transferred_amount, 
+      forward_ton_amount, custom_response_payload,
+      prices_packed
+    );
+
+    int enough_fee = liquidate_min_attachment(fwd_fee, liquidate_user_message) + forward_ton_amount;
+
+    throw_unless(
+      error::liquidate_asset_transaction_fees,
+      msg_value >= enough_fee
+    );
+
+    send_message_to_lending_wallet(
+      BLANK_CODE(), user_version, user_code, borrower_address, ;; <- the meaning is of owner_address
+      liquidate_user_message,
+      sendmode::CARRY_ALL_BALANCE ;; <- in combination with raw_reserve with mode=4
+      ;; should resend the whole value of the original message minus "amount" and fees
+    );
+  }
+
+  return asset_dynamics_collection;
+}
+
+cell liquidate_jetton(
+  int user_version, cell user_code, int query_id,
+  cell asset_config_collection, cell asset_dynamics_collection,
+  int msg_value, int fwd_fee,
+  slice borrower_address,
+  int collateral_asset_id, int min_collateral_amount,
+  slice liquidator_address,
+  int transferred_asset_id, int transferred_amount,
+  int forward_ton_amount, cell custom_response_payload,
+  cell prices_packed
+) impure inline {
+  return master_core_logic_liquidate_asset_unchecked(
+    user_version, user_code, query_id,
+    asset_config_collection, asset_dynamics_collection,
+    borrower_address,
+    collateral_asset_id, min_collateral_amount,
+    liquidator_address,
+    transferred_asset_id, transferred_amount,
+    0, ;; TON_reserve_amount
+    forward_ton_amount, custom_response_payload,
+    prices_packed,
+    fwd_fee, msg_value
+  );
+}
+
+cell liquidate_ton(
+  int user_version, cell user_code, int query_id,
+  cell asset_config_collection, cell asset_dynamics_collection,
+  int msg_value, int liquidate_incoming_amount, int fwd_fee,
+  slice borrower_address,
+  int collateral_asset_id, int min_collateral_amount,
+  slice liquidator_address, 
+  int forward_ton_amount, cell custom_response_payload,
+  cell prices_packed
+) impure inline {
+  ;; we don't reserve TON yet
+  ;; liquidation might fail right away
+  ;; and in that case we refund the received TON/jetton immediately
+  return master_core_logic_liquidate_asset_unchecked(
+    user_version, user_code, query_id,
+    asset_config_collection, asset_dynamics_collection,
+    borrower_address,
+    collateral_asset_id, min_collateral_amount,
+    liquidator_address,
+    constants::ton_asset_id,
+    ;; Withhold some amount of TONs for blockchain fees
+    liquidate_incoming_amount,
+    liquidate_incoming_amount, ;; TON_reserve_amount
+    forward_ton_amount, custom_response_payload,
+    prices_packed,
+    fwd_fee, msg_value
+  );
+}
+
+() liquidate_master_process  (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+  (slice borrower_address, slice liquidator_address, int collateral_asset_id, int min_collateral_amount, int liquidate_incoming_amount, int include_user_code, int forward_ton_amount, cell custom_response_payload, cell prices_packed) = parse_liquidate_master_message(in_msg_body);
+
+  throw_unless(error::invalid_address_provided, is_valid_address?(borrower_address));
+  throw_unless(error::invalid_address_provided, is_valid_address?(liquidator_address));
+  throw_if(error::invalid_data, collateral_asset_id == constants::ton_asset_id);
+  throw_unless(error::custom_response_payload_too_big, is_valid_custom_response_payload?(custom_response_payload));
+
+  int prices_error_code = prices_packed~prices_packed:error(oracles_info);
+  throw_if(prices_error_code, prices_error_code); ;; non-zero codes throw
+
+  (_, int user_version, _, _, _, cell user_code, _, _) = upgrade_config.unpack_upgrade_config();
+
+  asset_dynamics_collection = liquidate_ton(
+    user_version, include_user_code ? user_code : null(), query_id,
+    asset_config_collection, asset_dynamics_collection,
+    msg_value, liquidate_incoming_amount, fwd_fee,
+    borrower_address,
+    collateral_asset_id, min_collateral_amount,
+    liquidator_address, forward_ton_amount, custom_response_payload, prices_packed
+  );
+  ;; The only reason we save is to update s/b-rate of the corresponding asset
+  ;; this is just a request to liquidate, no confirmation yet,
+  ;; so no amounts change
+  master::storage::save(
+    meta, upgrade_config,
+    asset_config_collection,
+    if_active, oracles_info, admin, tokens_keys, 
+    asset_dynamics_collection
+  );
+  return ();
+}
+
+() liquidate_unsatisfied_process  (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+  var (
+    owner_address, liquidator_address,
+    transferred_asset_id, transferred_amount,
+    collateral_asset_id, min_collateral_amount,
+    forward_ton_amount, custom_response_payload,
+    error
+  ) = parse_liquidate_unsatisfied_message(in_msg_body);
+
+  ;; Verify this is a message from lending-user smart contract
+  throw_unless(
+    error::liquidate_unsatisfied_fake_sender,
+    slice_data_equal?(
+      sender_address,
+      calculate_user_address(BLANK_CODE(), owner_address)
+    )
+  );
+
+  msg_value -= fee::liquidate_unsatisfied;
+
+  (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(transferred_asset_id);
+
+  if (transferred_asset_id == constants::ton_asset_id){
+    raw_reserve(my_balance - transferred_amount - msg_value, reserve::REGULAR);
+  } else {
+    raw_reserve(0, 4);
+  }
+
+  send_asset_ext(
+    liquidator_address, query_id,
+    jw_address_hash, transferred_amount,
+    forward_ton_amount,
+    pack_liquidation_fail_report_message(begin_cell().store_slice(error), custom_response_payload),
+    sendmode::CARRY_ALL_BALANCE ;; <- in combination with raw_reserve with mode=4
+  );
+  ;; ^ Note how we don't check if that asset is available for refund,
+  ;; because it HAS to be available
+  ;; This is due to the fact that when we received the asset to use for liquidation, we didn't increase the in-storage balance of this asset's availability, thus making it not possible to use the received asset for anything other than the Refund
+
+  ;; Due to the same reason,
+  ;; we DON'T need to save anything to contract storage here - nothing changes there
+  return ();
+}
+
+() liquidate_satisfied_process  (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+  var (
+    owner_address, liquidator_address,
+    transferred_asset_id,
+    delta_loan_principal, liquidatable_amount, protocol_gift,
+    new_user_loan_principal,
+    collateral_asset_id,
+    delta_collateral_principal, collateral_reward,
+    min_collateral_amount,
+    new_user_collateral_principal, forward_ton_amount, custom_response_payload
+  ) = parse_liquidate_satisfied_message(in_msg_body);
+  ;; delta_loan_principal and delta_collateral_principal - are how much corresponding principals DECREASE
+  ;; delta_collateral_principal is going to be positive, because collateral is going to be send to liquidator
+  ;; delta_loan_principal is going to be negative, because liquidator transferred some 'loan', so loan_principal actually increased (so decrease is negative)
+
+  ;; Verify this is a message from lending-user smart contract
+  int user_version = upgrade_config.upgrade_config:user_code_version();
+  throw_unless(
+    error::liquidate_satisfied_fake_sender,
+    slice_data_equal?(
+      sender_address,
+      calculate_user_address(BLANK_CODE(), owner_address)
+    )
+  );
+
+  ;; Original amount sent for liquidation
+  int transferred_amount = liquidatable_amount + protocol_gift;
+  (int collateral_s_rate, int collateral_b_rate,
+   int collateral_total_supply_principal, int collateral_total_borrow_principal,
+   int collateral_last_accrual, int collateral_token_balance,
+   int collateral_tracking_supply_index, int collateral_tracking_borrow_index,
+   int collateral_awaited_supply
+   ) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(collateral_asset_id);
+
+  ;;NOTE if we want to set liquidity as supply - borrow then uncomment here
+  ;;int collateral_liquidity = get_asset_liquidity(
+  ;;  total_supply_principal, total_borrow_principal,
+  ;;  s_rate, b_rate
+  ;;);
+  int collateral_liquidity = collateral_token_balance;
+
+  if (collateral_reward <= collateral_liquidity) {
+    ;; Enough liquidity -> proceed with liquidation
+
+    int new_collateral_total_supply = collateral_total_supply_principal - delta_collateral_principal;
+    int new_collateral_total_borrow = collateral_total_borrow_principal;
+
+    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _
+    ) = asset_config_collection.asset_config_collection:get_unpacked(collateral_asset_id);
+
+    ;; Update collateral balance
+    asset_dynamics_collection~asset_dynamics_collection:set_packed(
+      collateral_asset_id,
+      collateral_s_rate, collateral_b_rate, ;; These are unpacked values
+      new_collateral_total_supply,
+      new_collateral_total_borrow,
+      collateral_last_accrual,
+      collateral_token_balance - collateral_reward, ;; Update balance
+      collateral_tracking_supply_index, collateral_tracking_borrow_index,
+      collateral_awaited_supply
+    );
+
+    (int loan_s_rate, int loan_b_rate,
+      int loan_total_supply_principal, int loan_total_borrow_principal,
+      int loan_last_accrual, int loan_token_balance,
+      int loan_tracking_supply_index, int loan_tracking_borrow_index,
+      int loan_awaited_supply
+      ) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(transferred_asset_id);
+
+    int loan_new_total_supply = loan_total_supply_principal;
+    int loan_new_total_borrow = loan_total_borrow_principal + delta_loan_principal;
+
+    asset_dynamics_collection~asset_dynamics_collection:set_packed(
+      transferred_asset_id,
+      loan_s_rate, loan_b_rate, ;; These are unpacked values
+      loan_new_total_supply,
+      loan_new_total_borrow,
+      ;; ^ Decreasing total principal (-) = Increasing borrow principal (+), that is why it's '+'
+      loan_last_accrual,
+      loan_token_balance + transferred_amount, ;; Update balance
+      loan_tracking_supply_index, loan_tracking_borrow_index,
+      loan_awaited_supply
+    );
+
+    ;; Notify lending-user of success
+    ;; So it can decrease ongoing liquidation count
+    int success_message_fee =
+    modest_fwd_fee_estimation(fwd_fee) + fee::liquidate_success;
+
+    send_message_to_lending_wallet_by_address(
+      null(), success_message_fee, ;; state_init don't need
+      user_version, null(), ;; null upgrade_info
+      sender_address, pack_liquidate_success_message(
+        query_id,
+        transferred_asset_id, delta_loan_principal,
+        loan_tracking_supply_index, loan_tracking_borrow_index,
+        collateral_asset_id, delta_collateral_principal,
+        collateral_tracking_supply_index, collateral_tracking_borrow_index
+      ),
+      sendmode::REGULAR
+    );
+
+    msg_value -= success_message_fee;
+    msg_value -= fee::log_tx;
+
+    cell log_data = begin_cell()
+      .store_uint(log::liquidate_success, 8) ;; withdraw code
+      .store_slice(owner_address) ;; user addr
+      .store_slice(sender_address) ;; user sc addr
+      .store_slice(liquidator_address) ;; liquidator addr
+      .store_uint(now(), 32) ;; current time
+      .store_ref(begin_cell() ;; attached supply asset data
+        .store_uint(transferred_asset_id, 256)
+        .store_uint(transferred_amount, 64)
+        .store_int(new_user_loan_principal, 64)
+        .store_int(loan_new_total_supply, 64)
+        .store_int(loan_new_total_borrow, 64)
+        .store_uint(loan_s_rate, 64)
+        .store_uint(loan_b_rate, 64)
+        .end_cell())
+      .store_ref(begin_cell() ;; attached redeemed asset data
+        .store_uint(collateral_asset_id, 256)
+        .store_uint(collateral_reward, 64)
+        .store_int(new_user_collateral_principal, 64)
+        .store_int(new_collateral_total_supply, 64)
+        .store_int(new_collateral_total_borrow, 64)
+        .store_uint(collateral_s_rate, 64)
+        .store_uint(collateral_b_rate, 64)
+        .end_cell())
+      .end_cell();
+
+    emit_log_simple(log_data);
+
+    if (collateral_asset_id == constants::ton_asset_id){
+      raw_reserve(my_balance - collateral_reward - msg_value, reserve::REGULAR);
+    } else {
+      raw_reserve(0, 4);
+    }
+
+    send_asset_ext(
+      liquidator_address, query_id,
+      jw_address_hash, collateral_reward,
+      forward_ton_amount,
+      pack_liquidation_success_report_message(
+        query_id,
+        transferred_asset_id,
+        transferred_amount,
+        collateral_asset_id,
+        collateral_reward,
+        custom_response_payload
+      ),
+      sendmode::CARRY_ALL_BALANCE
+    );
+
+    master::storage::save(
+      meta, upgrade_config,
+      asset_config_collection,
+      if_active, oracles_info, admin, tokens_keys, 
+      asset_dynamics_collection
+    );
+    ;; return() is right after "if-else" block
+  } else {
+    ;; Not enough liquidity - revert
+    ;; ???? It strict rejects
+    ;; but *maybe* it should allow transactions where 
+    ;; collateral_liquidity >= min_collateral_amount
+
+    ;; Notify lending-user of fail
+    ;; So it can revert liquidation changes
+    ;; and unlock itself
+    int fail_message_fee =
+      modest_fwd_fee_estimation(fwd_fee) + fee::liquidate_fail;
+
+    send_message_to_lending_wallet_by_address(
+      null(), fail_message_fee, ;; state_init don't need
+      user_version, null(), ;; null upgrade_info
+      sender_address, pack_liquidate_fail_message(
+        query_id,
+        transferred_asset_id,
+        delta_loan_principal,
+        collateral_asset_id,
+        delta_collateral_principal
+      ),
+      sendmode::REGULAR
+    );
+
+    msg_value -= fail_message_fee;
+
+    if (transferred_asset_id == constants::ton_asset_id){
+      raw_reserve(my_balance - transferred_amount - msg_value, reserve::REGULAR);
+    } else {
+      raw_reserve(0, 4);
+    }
+
+    ;; Refund asset
+    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(transferred_asset_id);
+    send_asset_ext(
+      liquidator_address, query_id,
+      jw_address_hash, transferred_amount,
+      forward_ton_amount,
+      pack_liquidation_fail_report_message(
+        build_master_not_enough_liquidity_error(
+          collateral_liquidity
+        ),
+        custom_response_payload
+      ),
+      sendmode::CARRY_ALL_BALANCE
+    );
+    ;; Once again (as with Liquidation Unsatisfied):
+    ;; we don't need to check if enough of transferred_asset is available for refund - there HAS to be
+    ;; and we don't need to update contract storage - nothing changed
+  }
+  return ();
+}
+
+() liquidate_satisfied_handle_exception (
+  int my_balance, int msg_value, slice in_msg_body, slice sender_address, int fwd_fee,
+  cell upgrade_config, cell asset_config_collection, int query_id
+) impure inline {
+  ;; There might be some duplicated code from above, but this is an exception handler
+  ;; Therefore, it should have distinct code, and merging it into some common function may have
+  ;;   unintended side effects in the future
+
+  var (
+    _, liquidator_address, transferred_asset_id, delta_loan_principal, liquidatable_amount,
+    protocol_gift, _, collateral_asset_id, delta_collateral_principal, _, _, _, forward_ton_amount, custom_response_payload
+  ) = parse_liquidate_satisfied_message(in_msg_body);
+
+  int user_version = upgrade_config.upgrade_config:user_code_version();
+
+  int fail_message_fee = modest_fwd_fee_estimation(fwd_fee) + fee::liquidate_fail;
+
+  int transferred_amount = liquidatable_amount + protocol_gift;
+
+  send_message_to_lending_wallet_by_address(
+    null(), fail_message_fee, ;; state_init don't need
+    user_version, null(), ;; null upgrade_info
+    sender_address, pack_liquidate_fail_message(
+      query_id,
+      transferred_asset_id,
+      delta_loan_principal,
+      collateral_asset_id,
+      delta_collateral_principal
+    ),
+    sendmode::REGULAR
+  );
+
+  msg_value -= fail_message_fee;
+
+  if (transferred_asset_id == constants::ton_asset_id){
+    raw_reserve(my_balance - transferred_amount - msg_value, reserve::REGULAR);
+  } else {
+    raw_reserve(0, 4);
+  }
+
+  ;; Refund asset
+  (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _)
+    = asset_config_collection.asset_config_collection:get_unpacked(transferred_asset_id);
+
+  send_asset_ext(
+    liquidator_address, query_id,
+    jw_address_hash, transferred_amount,
+    forward_ton_amount,
+    pack_liquidation_fail_report_message(
+      build_execution_crashed_error(),
+      custom_response_payload
+    ),
+    sendmode::CARRY_ALL_BALANCE
+  );
+}
+
+() liquidate_master_jetton_process  (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int jetton_op_code, int query_id, int jetton_amount, slice from_address, int user_version, cell user_code ;; jetton tx body params
+) impure inline {
+  (slice borrower_address, slice liquidator_address, int collateral_asset_id, int min_collateral_amount, _, int include_user_code, int forward_ton_amount, cell custom_response_payload, cell prices_packed) = parse_liquidate_master_message(in_msg_body);
+  (slice token_id, int found) = tokens_keys.udict_get?(256, addr_hash);
+
+  ifnot(is_valid_custom_response_payload?(custom_response_payload)) {
+    respond_send_jetton(
+      sender_address, from_address,
+      query_id, jetton_amount,
+      begin_cell().store_op_code(error::custom_response_payload_too_big).end_cell(), forward_ton_amount
+    );
+    return ();
+  }
+
+  int addresses_are_valid = is_valid_address?(borrower_address) & is_valid_address?(liquidator_address);
+  ifnot (addresses_are_valid) {
+    respond_send_jetton(
+      sender_address, from_address,
+      query_id, jetton_amount,
+      begin_cell().store_op_code(error::invalid_address_provided).store_ref(custom_response_payload).end_cell(), forward_ton_amount
+    );
+    return ();
+  }
+
+  int prices_error_code = prices_packed~prices_packed:error(oracles_info);
+  if (prices_error_code) { ;; non-zero codes are errors
+    respond_send_jetton(
+      sender_address, from_address,
+      query_id, jetton_amount,
+      begin_cell().store_op_code(prices_error_code).store_ref(custom_response_payload).end_cell(), forward_ton_amount
+    );
+    return ();
+  }
+
+  int transferred_asset_id = token_id~load_asset_id();
+  if (collateral_asset_id == transferred_asset_id) {
+    respond_send_jetton(
+      sender_address, from_address,
+      query_id, jetton_amount,
+      begin_cell().store_op_code(error::invalid_data).store_ref(custom_response_payload).end_cell(), forward_ton_amount
+    );
+    return ();
+  }
+
+  asset_dynamics_collection = liquidate_jetton(
+    user_version, include_user_code ? user_code : null(), query_id,
+    asset_config_collection, asset_dynamics_collection,
+    msg_value, fwd_fee,
+    borrower_address,
+    collateral_asset_id, min_collateral_amount,
+    liquidator_address, ;; address of whoever sent jettons - that's gonna be liquidator
+    transferred_asset_id, jetton_amount,
+    forward_ton_amount, custom_response_payload,
+    prices_packed
+  );
+
+  master::storage::save(
+    meta, upgrade_config,
+    asset_config_collection,
+    if_active, oracles_info, admin, tokens_keys, 
+    asset_dynamics_collection
+  );
+  return ();
+}

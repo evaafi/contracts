@@ -1,0 +1,35 @@
+#include "../external/stdlib.fc";
+#include "../data/basic-types.fc";
+
+(builder) user::upgrade::store_header(
+	builder source, int user_version, cell upgrade_info,
+	int upgrade_exec
+) method_id(666) {
+	source = (
+		source
+			.store_coins(user_version)
+			.store_maybe_ref(upgrade_info)
+			.store_int(upgrade_exec, 2)
+	);
+	return source;
+}
+
+;; Required for compability of upgrades from v4 and v5 version.
+;; This method must have ID 41 for user contract (user.fc)
+(builder) user::upgrade::store_header_compat(
+	builder source, int user_version, cell upgrade_info,
+	int upgrade_exec
+) {
+	return user::upgrade::store_header(source, user_version, upgrade_info, upgrade_exec);
+}
+
+(slice, (int, cell, int)) user::upgrade::load_header(slice cs) {
+	int user_version = cs~load_coins();
+	cell upgrade_info = cs~load_maybe_ref();
+	int upgrade_exec = cs~load_bool_ext();
+
+	return (cs,
+		(user_version, upgrade_info,
+		upgrade_exec)
+	);
+}

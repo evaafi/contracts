@@ -1,0 +1,191 @@
+#include "../external/stdlib.fc";
+#include "../constants/errors.fc";
+
+const int max_timestamp_delta = 180;
+
+const int exotic_cell_type::merkle_proof = 3;
+
+const int int::max = 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff;
+
+int prices_packed:get(cell prices_packed, int asset_id) inline {
+    (slice price_packed, _) = prices_packed.udict_get?(256, asset_id);
+    int result = price_packed~load_coins();
+    price_packed.end_parse();
+    return result;
+}
+
+int prices_packed:get?(cell prices_packed, int asset_id) inline {
+	(slice price_packed, int found) = prices_packed.udict_get?(256, asset_id);
+    ifnot (found) {
+        return -1;
+    }
+    int result = price_packed~load_coins();
+    price_packed.end_parse();
+    return result;
+}
+
+(slice, int) begin_parse_exotic?(cell c) asm "XCTOS";
+
+(tuple, int) parse_check_oracles_data(cell oracles_data, cell oracles) impure inline_ref {
+    tuple res = null();
+
+    int cnt = 0;
+    int last_oracle_id = -1;
+    do {
+        slice cs = oracles_data.begin_parse();
+        int oracle_id = cs~load_uint(32);
+        cell proof = cs~load_ref();
+        slice signature = cs~load_bits(512);
+        oracles_data = cs~load_maybe_ref();
+        cs.end_parse();
+
+        (slice ps, int exotic?) = proof.begin_parse_exotic?();
+        throw_unless(error::prices_incorrect_proof, exotic?);
+        throw_unless(error::prices_incorrect_proof, ps~load_uint(8) == exotic_cell_type::merkle_proof);
+        int original_hash = ps~load_uint(256); ;; TON automatically checks that the hash is indeed proven
+
+        (slice vs, int found?) = oracles.udict_get?(32, oracle_id);
+        throw_unless(error::prices_no_such_oracle, found?);
+        int pubkey = vs~load_uint(256);
+        throw_unless(error::prices_incorrect_signature, check_signature(original_hash, signature, pubkey));
+
+        throw_unless(error::prices_incorrect_sequence, oracle_id > last_oracle_id); ;; no data is duplicated
+        last_oracle_id = oracle_id;
+        cnt += 1;
+
+        slice ds = ps~load_ref().begin_parse();
+        ps~skip_bits(16); ;; depth of the deleted subtree, which was replaced by the reference
+        ps.end_parse();
+        int timestamp = ds~load_uint(32);
+        cell prices = ds~load_dict();
+        ds.end_parse();
+
+        int delta = now() - timestamp;
+        throw_unless(error::prices_incorrect_timestamp, (delta >= 0) & (delta < max_timestamp_delta));
+
+        res = cons(prices, res); ;; might add [oracle_id, timestamp, prices] instead
+    } until oracles_data.cell_null?();
+
+    return (res, cnt);
+}
+
+slice udict_get(cell dict, int key_len, int index) asm(index dict key_len) "DICTUGET" "10 THROWIFNOT";
+
+int check_suggested_price(int asset_id, int price, tuple oracles_prices, int cnt) impure inline_ref {
+    if (cnt % 2) {
+        ;; median is unique, just check that the price is a median
+        int leq_cnt = 0;
+        int geq_cnt = 0;
+        repeat (cnt) {
+            cell prices_dict = oracles_prices~list_next();
+            slice cs = prices_dict.udict_get(256, asset_id);
+            int oracle_price = cs~load_coins();
+            leq_cnt -= (oracle_price <= price);
+            geq_cnt -= (oracle_price >= price);
+        }
+        return (leq_cnt * 2 >= cnt) & (geq_cnt * 2 >= cnt);
+    } else {
+        ;; median is not unique
+        ;; price should be equal to average of two nearest neighbors
+
+        int le_cnt = 0;
+        int gt_cnt = 0;
+        int le_max = -1;
+        int gt_min = int::max;
+        repeat(cnt) {
+            cell prices_dict = oracles_prices~list_next();
+            slice cs = prices_dict.udict_get(256, asset_id);
+            int oracle_price = cs~load_coins();
+            if (oracle_price < price) {
+                le_cnt += 1;
+                le_max = max(le_max, oracle_price);
+            }
+            if (oracle_price > price) {
+                gt_cnt += 1;
+                gt_min = min(gt_min, oracle_price);
+            }
+        }
+
+        int cnt/2 = cnt / 2;
+        if (le_cnt == cnt/2) & (gt_cnt == cnt/2) { ;; most common case
+            return price == (le_max + gt_min) / 2;
+        }
+
+        int leq_cnt = cnt - gt_cnt;
+        int geq_cnt = cnt - le_cnt;
+        ifnot (leq_cnt >= cnt/2) & (geq_cnt >= cnt/2) { ;; it's not a median
+            return false;
+        }
+
+        ;; it's median, but it is equal to some element
+        ;; Possible cases:
+        ;; (1) price is equal to both neighbors
+        ;; (2) price is equal to left neighbor and 1 unit less than right neigbor
+        ;; (3) price is incorrect (not average of two neighbors)
+
+        if (gt_cnt == cnt/2) {
+            ;; price is less than the rigth neighbor, but equal to the left one
+            ;; check that the difference is indeed 1
+            return price == gt_min - 1;
+        }
+
+        return (le_cnt < cnt/2); ;; check that both neigbors are equal
+    }
+}
+
+cell retrieve_median_prices(slice oracles_info, cell assets, cell oracles_data) impure inline {
+    int total_oracles = oracles_info~load_uint(16);
+    int threshold = oracles_info~load_uint(16);
+    cell oracles = oracles_info.preload_ref();
+
+    (tuple oracles_prices, int cnt) = parse_check_oracles_data(oracles_data, oracles);
+
+    throw_unless(error::prices_not_enough_data, cnt >= threshold);
+    throw_if(error::prices_too_much_data, cnt > total_oracles);
+
+    cell res = new_dict();
+    do {
+        slice cs = assets.begin_parse();
+        int id = cs~load_uint(256);
+        int price = cs~load_coins();
+        assets = cs~load_maybe_ref();
+        cs.end_parse();
+
+        throw_unless(error::prices_not_positive, price > 0);
+        throw_unless(error::prices_incorrect_suggested_price, check_suggested_price(id, price, oracles_prices, cnt));
+        res~udict_set_builder(256, id, begin_cell().store_coins(price));
+    } until assets.null?();
+
+    return res;
+}
+
+;; Calling code MUST process prices_packed:error's result and check it for error
+;; the reason prices_packed:error doesn't throw exceptions itself is because:
+;; refunding Jettons requires manually sending a message
+;; (just throwing an exception can only refund TONs, but not Jettons)
+(cell, int) prices_packed:error (cell prices_packed, slice oracles_info) impure {
+    slice prices_unpacked = prices_packed.begin_parse();
+    cell assets = prices_unpacked~load_ref();
+    cell oracles_data = prices_unpacked~load_ref();
+    prices_unpacked.end_parse();
+    try {
+        cell res = retrieve_median_prices(oracles_info, assets, oracles_data);
+        return (res, 0);
+    }
+    catch(_, int n) {
+        return (null(), n);
+    }
+    {-
+    cell prices_dict = prices_unpacked~load_ref();
+    slice signature = prices_unpacked~load_bits(512);
+    int packed_dict_hash = cell_hash(prices_dict);
+    ;; int result = check_signature(packed_dict_hash, signature, oracles_info); ;; admin PK / not address!
+    if (~ result) { return (null(), error::prices_prices_signature_invalid); }
+    int time_key = "time"H;
+    (slice time_packed, int found?) = prices_dict~udict_delete_get?(256, time_key);
+    int timeout = 180;
+    int time = time_packed~load_uint(64);
+    if (now() > time + timeout) { return (null(), error::prices_prices_expired); }
+    return (prices_dict, 0);
+    -}
+}

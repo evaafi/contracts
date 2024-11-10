@@ -1,0 +1,359 @@
+#include "../constants/constants.fc";
+#include "../external/stdlib.fc";
+#include "../constants/fees.fc";
+#include "../storage/user-storage.fc";
+#include "../messages/liquidate-message.fc";
+#include "../logic/tx-utils.fc";
+#include "../logic/user-utils.fc";
+
+() liquidate_success_process (
+  slice sender_address, slice in_msg_body_original, int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; handle_transaction params
+  int code_version, slice master_address, slice owner_address, cell user_principals, int state, cell user_rewards, cell backup_cell_1, cell backup_cell_2, ;; user storage params
+  int op, int query_id ;; tx body params
+) impure inline {
+  (
+    int transferred_asset_id,
+    int delta_loan_principal,
+    int loan_tracking_supply_index, int loan_tracking_borrow_index,
+    int collateral_asset_id,
+    int delta_collateral_principal,
+    int collateral_tracking_supply_index, int collateral_tracking_borrow_index
+  ) = parse_liquidate_success_message(in_msg_body);
+
+  {
+    int new_principal = user_principals.get_principal(collateral_asset_id);
+    int old_principal = new_principal + delta_collateral_principal;
+
+    (int base_tracking_index, int base_tracking_accrued) = user_rewards.get_reward(collateral_asset_id);
+
+    (base_tracking_index, base_tracking_accrued) = accrue_user_indexes(base_tracking_index, base_tracking_accrued, collateral_tracking_supply_index, collateral_tracking_borrow_index, old_principal, new_principal);
+
+    user_rewards~set_reward(collateral_asset_id, base_tracking_index, base_tracking_accrued);
+  }
+
+  {
+    int new_principal = user_principals.get_principal(transferred_asset_id);
+    int old_principal = new_principal + delta_loan_principal;
+
+    (int base_tracking_index, int base_tracking_accrued) = user_rewards.get_reward(transferred_asset_id);
+
+    (base_tracking_index, base_tracking_accrued) = accrue_user_indexes(base_tracking_index, base_tracking_accrued, loan_tracking_supply_index, loan_tracking_borrow_index, old_principal, new_principal);
+
+    user_rewards~set_reward(transferred_asset_id, base_tracking_index, base_tracking_accrued);
+  }
+   
+  try_reserve_and_send_rest(
+    fee::min_tons_for_storage,
+    owner_address, 
+    pack_liquidate_excess_message(
+      op::liquidate_success_report_to_user,
+      query_id
+    )
+  );
+
+  user::storage::save(
+    code_version,
+    master_address, owner_address,
+    user_principals, state - 1, ;; Decrease ongoing liquidation count
+    user_rewards, backup_cell_1, backup_cell_2
+  );
+  return ();
+}
+
+() liquidate_success_handle_exception (
+  int code_version, slice master_address, slice owner_address, cell user_principals, int state, cell user_rewards, cell backup_cell_1, cell backup_cell_2, int query_id
+) impure inline {
+  try_reserve_and_send_rest(
+    fee::min_tons_for_storage,
+    owner_address,
+    pack_liquidate_excess_message(
+      op::liquidate_success_report_to_user,
+      query_id
+    )
+  );
+
+  user::storage::save(
+    code_version,
+    master_address, owner_address,
+    user_principals, state - 1, ;; Decrease ongoing liquidation count
+    user_rewards, backup_cell_1, backup_cell_2
+  );
+  return ();
+}
+
+() liquidate_fail_process(
+  slice sender_address, slice in_msg_body_original, int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; handle_transaction params
+  int code_version, slice master_address, slice owner_address, cell user_principals, int state, cell user_rewards, cell backup_cell_1, cell backup_cell_2, ;; user storage params
+  int op, int query_id ;; tx body params
+) impure inline {
+  (
+    int transferred_asset_id,
+    int delta_loan_principal, ;; liquidatable_amount, protocol_gift, <- not relevant
+    int collateral_asset_id,
+    int delta_collateral_principal ;; collateral_reward <- not relevant
+    ;; debug info:
+    ;; , min_collateral_amount, collateral_present  <- not relevant
+  ) = parse_liquidate_fail_message(in_msg_body);
+  ;; liquidation failed - revert
+  int optimistic_collateral_principal = user_principals.get_principal(collateral_asset_id);
+  int reverted_collateral_principal = optimistic_collateral_principal + delta_collateral_principal; 
+  user_principals~set_principal(collateral_asset_id, reverted_collateral_principal);
+
+  int optimistic_loan_principal = user_principals.get_principal(transferred_asset_id);
+  int reverted_loan_principal = optimistic_loan_principal + delta_loan_principal; 
+  user_principals~set_principal(transferred_asset_id, reverted_loan_principal);
+  ;; Unlike op::withdraw_fail, we don't refund TON attachment to the owner here
+  ;; because it is handled while refunding liquidation- (transferred-) asset on the master
+  ;; Update user_principals and liquidation count
+  user::storage::save(
+    code_version,
+    master_address, owner_address,
+    user_principals, state - 1, ;; Decrease ongoing liquidation count
+    user_rewards, backup_cell_1, backup_cell_2
+  ); 
+  return ();
+}
+
+
+() liquidate_user_process(
+  slice sender_address, slice in_msg_body_original, int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; handle_transaction params
+  int code_version, slice master_address, slice owner_address, cell user_principals, int state, cell user_rewards, cell backup_cell_1, cell backup_cell_2, ;; user storage params
+  int op, int query_id ;; tx body params
+) impure inline {
+  (cell asset_config_collection, cell asset_dynamics_collection, cell prices_packed,
+   int collateral_asset_id, int min_collateral_amount,
+   slice liquidator_address,
+   int transferred_asset_id, int transferred_amount,
+   int forward_ton_amount, cell custom_response_payload
+   )
+   = parse_liquidate_user_message(in_msg_body);
+  
+  if (state < 0) {
+    reserve_and_send_rest(
+      fee::min_tons_for_storage,
+      master_address,
+      pack_liquidate_unsatisfied_message(
+        query_id, owner_address,
+        liquidator_address,
+        transferred_asset_id, transferred_amount,
+        collateral_asset_id, min_collateral_amount,
+        forward_ton_amount, custom_response_payload,
+        build_user_withdraw_in_progress_error()
+      )
+    );
+    return ();
+  }
+  
+  ;; ----- Check is liquidatable and if all neccessary prices are supplied -----
+  (int liquidatable, int enough_price_data, int supply_amount, int borrow_amount) =
+    is_liquidatable(asset_config_collection, asset_dynamics_collection, user_principals, prices_packed);
+  ifnot (liquidatable) {
+    ;; if prices_ok is false, liquidatable is also false
+    builder message = enough_price_data
+      ? build_not_liquidatable_error()
+      : build_liquidation_prices_missing();
+    reserve_and_send_rest(
+      fee::min_tons_for_storage,
+      master_address,
+      pack_liquidate_unsatisfied_message(
+        query_id, owner_address,
+        liquidator_address,
+        transferred_asset_id, transferred_amount,
+        collateral_asset_id, min_collateral_amount,
+        forward_ton_amount, custom_response_payload,
+        message
+      )
+    );
+    return (); 
+  }
+
+  ;; ----- Check enough loan -----
+  (int loan_s_rate, int loan_b_rate, _, _, _, _, _, _, _)
+    = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(transferred_asset_id);
+  int loan_principal = user_principals.get_principal(transferred_asset_id);
+  int loan_present = - present_value(loan_s_rate, loan_b_rate, loan_principal);
+
+  (_, _, _, _, int liquidation_bonus, _, _, _, _, _, _, _, _, _, _, int liquidation_reserve_factor, _, _, _) =
+    asset_config_collection.asset_config_collection:get_unpacked(collateral_asset_id);
+
+  int transferred_amount_minus_reserve = muldiv(transferred_amount, (constants::reserve_liquidation_scale - liquidation_reserve_factor), constants::reserve_liquidation_scale);
+
+  int liquidatable_amount = min(transferred_amount_minus_reserve, loan_present);
+  ;; ^ Can't liquidate more than the current loan
+  ;; loan_present can be < 0, in case there is no loan on this position
+  ;; this is not a problem because subsequent call to get_collateral_quote will return a negative amount
+  ;; and the subsequent check that this amount satisfies min_collateral_amount will fail
+  ;; transferred_amount is still used further in the code though, because in case of liquidation failure we need to refund the full transferred_amount
+
+  ;; ---- Check min_collateral_amount satisfied ----
+  (int collateral_amount, enough_price_data) = get_collateral_quote(
+    asset_config_collection,
+    transferred_asset_id, liquidatable_amount,
+    collateral_asset_id, prices_packed
+    ;; collateralization ;; liquidation_bonus <- There was an idea to calculate it dynamically
+  );
+  ;; min_collateral_amount is uint, and therefore is always >= 0
+  ;;
+  if (collateral_amount < min_collateral_amount) {
+    ;; if not enough price data, collateral_amount will be -1
+    builder message = enough_price_data
+      ? build_min_collateral_not_satisfied_error(collateral_amount)
+      : build_liquidation_prices_missing();
+    reserve_and_send_rest(
+      fee::min_tons_for_storage,
+      master_address,
+      pack_liquidate_unsatisfied_message(
+        query_id, owner_address,
+        liquidator_address,
+        transferred_asset_id, transferred_amount,
+        collateral_asset_id, min_collateral_amount,
+        forward_ton_amount, custom_response_payload,
+        message
+      )
+    );
+    return (); 
+  }
+
+  ;; ----- Check enough collateral -----
+  (int collateral_s_rate, int collateral_b_rate, _, _, _, _, _, _, _)
+    = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(collateral_asset_id);
+  int collateral_principal = user_principals.get_principal(collateral_asset_id);
+  int collateral_present = present_value(collateral_s_rate, collateral_b_rate, collateral_principal);
+
+  if (collateral_present < min_collateral_amount) {
+    reserve_and_send_rest(
+      fee::min_tons_for_storage,
+      master_address,
+      pack_liquidate_unsatisfied_message(
+        query_id, owner_address,
+        liquidator_address,
+        transferred_asset_id, transferred_amount,
+        collateral_asset_id, min_collateral_amount,
+        forward_ton_amount, custom_response_payload,
+        build_user_not_enough_collateral_error(collateral_present)
+      )
+    );
+    return (); 
+  }
+
+  int collateral_reward = min(
+    collateral_amount,
+    collateral_present ;; Not rewarding more of asset then there is on user's balance
+  );
+
+  int isBadDebt = borrow_amount != 0
+    ? (supply_amount * constants::asset_coefficient_scale / borrow_amount) < liquidation_bonus
+    : false;
+
+  ifnot (isBadDebt) {
+    ;; ----- Check not liquidating too much -----
+    int max_not_too_much = muldiv(collateral_present, 1, 2);
+    {
+      ;; Below certain value ($100?) should be liquidatable entirely:
+      int collateral_decimals = asset_config_collection.asset_config_collection:decimals(collateral_asset_id);
+      ;; get_collateral_quote higher in code checks that collateral_asset_id price is present
+      int collateral_price = prices_packed.prices_packed:get(collateral_asset_id);
+
+      int usd_allowed_liquidation = 100;
+      ;; atomic_amount = usd_allowed_liquidation / price_per_atomic
+      ;; atomic_amount = usd_allowed_liquidation / (price_per_unit / fast_dec_pow(collateral_decimals))
+      ;; atomic_amount = usd_allowed_liquidation / ((collateral_price / constants::price_scale) / fast_dec_pow(collateral_decimals))
+      ;; atomic_amount = usd_allowed_liquidation * constants::price_scale * fast_dec_pow(collateral_decimals) / collateral_price;
+      int max_not_too_much_fixed = collateral_price != 0
+        ? usd_allowed_liquidation * constants::price_scale * fast_dec_pow(collateral_decimals) / collateral_price
+        : max_not_too_much;
+      if (max_not_too_much_fixed > max_not_too_much) {
+        max_not_too_much = max_not_too_much_fixed;
+      }
+      ;; Note that throughout the rest of the code, constants::price_scale doesn't really matter:
+      ;; Withdraw and Liquidate are relative: we could multiply all prices by the same amount and nothing would change
+      ;; (well, as long as division errors and storage bit-restrictions don't come into play)
+      ;; This is the *only* place were we operate with the absolute value of some asset (equivalent of $100)
+      ;; instead of operating relative to other assets (like everywhere else)
+    }
+    ;; Essentially, max_not_too_much = max(collateral_present*50%, $100 / exchange_rate)
+    ;; NOTE: !!!! ^ 50% and $100 - very arbitrary
+    if (max_not_too_much < min_collateral_amount) {
+      reserve_and_send_rest(
+        fee::min_tons_for_storage,
+        master_address,
+        pack_liquidate_unsatisfied_message(
+          query_id, owner_address,
+          liquidator_address,
+          transferred_asset_id, transferred_amount,
+          collateral_asset_id, min_collateral_amount,
+          forward_ton_amount, custom_response_payload,
+          build_user_liquidating_too_much_error(max_not_too_much)
+        )
+      );
+      return ();
+    }
+
+    collateral_reward = min(
+      collateral_reward,
+      max_not_too_much ;; And no more than would be too much
+    );
+  }
+  
+  collateral_present -= collateral_reward;
+  loan_present -= liquidatable_amount;
+  int new_loan_principal = principal_value(loan_s_rate, loan_b_rate, - loan_present);
+  int new_collateral_principal = principal_value(collateral_s_rate, collateral_b_rate, collateral_present);
+  ;; NOTE: ^ It is well known which sign (collateral - positive and loan - negative) these values have,
+  ;; so might as well use more direct function to calculate present_value to save some gas
+
+  ;; int delta_loan_principal = new_loan_principal - loan_principal; ;; loan principals are negative => reverse subtraction order <- Wrong
+  int delta_loan_principal = loan_principal - new_loan_principal; ;; How much (a)Loan (b)Decreased is loan_old-loan_new
+  int delta_collateral_principal = collateral_principal - new_collateral_principal;
+  int protocol_gift = transferred_amount - liquidatable_amount; ;; ??? Free assets for the protocol
+  reserve_and_send_rest(
+    fee::min_tons_for_storage,
+    master_address,
+    pack_liquidate_satisfied_message(
+      query_id,
+      owner_address, liquidator_address,
+      transferred_asset_id,
+      delta_loan_principal, liquidatable_amount, protocol_gift,
+      new_loan_principal,
+      collateral_asset_id,
+      delta_collateral_principal, collateral_reward, min_collateral_amount,
+      new_collateral_principal,
+      forward_ton_amount, custom_response_payload
+    )
+  );
+  user_principals~set_principal(collateral_asset_id, new_collateral_principal);
+  user_principals~set_principal(transferred_asset_id, new_loan_principal);
+  user::storage::save(
+    code_version,
+    master_address, owner_address,
+    user_principals,
+    state + 1, ;; Increase ongoing liquidation count
+     user_rewards, backup_cell_1, backup_cell_2
+  );
+  return ();
+}
+
+() liquidate_user_handle_exception(
+  slice in_msg_body, slice master_address, slice owner_address, int query_id
+) impure inline {
+  (_, _, _,
+    int collateral_asset_id, int min_collateral_amount,
+    slice liquidator_address,
+    int transferred_asset_id, int transferred_amount,
+    int forward_ton_amount, cell custom_response_payload
+    )
+  = parse_liquidate_user_message(in_msg_body);
+
+  reserve_and_send_rest(
+    fee::min_tons_for_storage,
+    master_address,
+    pack_liquidate_unsatisfied_message(
+      query_id, owner_address,
+      liquidator_address,
+      transferred_asset_id, transferred_amount,
+      collateral_asset_id, min_collateral_amount,
+      forward_ton_amount, custom_response_payload,
+      build_execution_crashed_error()
+    )
+  );
+}

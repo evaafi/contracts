@@ -1,0 +1,121 @@
+#include "../external/stdlib.fc";
+#include "../data/universal-dict.fc";
+
+const int user::code::version = 1;
+
+(cell) user::upgrade::pack_universal_storage(
+    slice master_address, slice owner_address, cell user_principals, int state,
+    int tracking_supply_index, int tracking_borrow_index, int dutch_auction_start_timestamp, cell backup_cell
+) method_id(0x153) {
+    cell storage = new_dict();
+    storage~udict_set_builder(
+        256, "master_address"H,
+        begin_cell().store_slice(master_address)
+    );
+    storage~udict_set_builder(
+        256, "owner_address"H,
+        begin_cell().store_slice(owner_address)
+    );
+    storage~udict_set_builder(
+        256, "user_principals"H,
+        begin_cell().store_dict(user_principals)
+    );
+    storage~udict_set_builder(
+        256, "state"H,
+        begin_cell().store_int(state, 64)
+    );
+    return storage;
+}
+
+(cell) user::upgrade::pack_universal_storage_after_v6(
+    slice master_address, slice owner_address, cell user_principals, int state, cell user_rewards, cell backup_cell_1, cell backup_cell_2
+) method_id(0x1561) {
+    cell storage = new_dict();
+    storage~udict_set_builder(
+        256, "master_address"H,
+        begin_cell().store_slice(master_address)
+    );
+    storage~udict_set_builder(
+        256, "owner_address"H,
+        begin_cell().store_slice(owner_address)
+    );
+    storage~udict_set_builder(
+        256, "user_principals"H,
+        begin_cell().store_dict(user_principals)
+    );
+    storage~udict_set_builder(
+        256, "state"H,
+        begin_cell().store_int(state, 64)
+    );
+    storage~udict_set_builder(
+        256, "user_rewards"H,
+        begin_cell().store_dict(user_rewards)
+    );
+    storage~udict_set_builder(
+        256, "backup_cell_1"H,
+        begin_cell().store_maybe_ref(backup_cell_1)
+    );
+    storage~udict_set_builder(
+        256, "backup_cell_2"H,
+        begin_cell().store_maybe_ref(backup_cell_2)
+    );
+    return storage;
+}
+
+
+;; storage - universal storage packed by the previous version of code
+;; old_code_version - the previuos version of code, we might theoretically need it in some tricky cases. Hopefully, we won't
+;; new_data - data arriving from Master, packed exactly for empty/Blank contracts. We might need to parse it in case we expect new info from Master to incorporate into existing User contracts
+builder user::upgrade::unpack_universal_storage(
+    int old_code_version, cell storage,
+    cell new_data
+) method_id(0x157) {
+    builder new_storage = begin_cell();
+    
+    slice value = storage.upgrade_storage:get!("master_address"H);
+    new_storage = new_storage.store_slice(value);
+
+    slice value = storage.upgrade_storage:get!("owner_address"H);
+    new_storage = new_storage.store_slice(value);
+
+    slice value = storage.upgrade_storage:get!("user_principals"H);
+    new_storage = new_storage.store_dict(value~load_dict());
+
+    slice value = storage.upgrade_storage:get!("state"H);
+    new_storage = new_storage.store_int(value~load_int(64), 64);
+
+    return new_storage;
+}
+
+builder user::upgrade::unpack_universal_storage_version_after_update(
+    int old_code_version, cell storage,
+    cell new_data
+) method_id(0x1571) {
+    builder new_storage = begin_cell();
+    
+    slice value = storage.upgrade_storage:get!("master_address"H);
+    new_storage = new_storage.store_slice(value);
+
+    slice value = storage.upgrade_storage:get!("owner_address"H);
+    new_storage = new_storage.store_slice(value);
+
+    slice value = storage.upgrade_storage:get!("user_principals"H);
+    new_storage = new_storage.store_dict(value~load_dict());
+
+    slice value = storage.upgrade_storage:get!("state"H);
+    new_storage = new_storage.store_int(value~load_int(64), 64);
+    
+    slice value = storage.upgrade_storage:get!("tracking_supply_index"H);
+    new_storage = new_storage.store_uint(value~load_uint(64), 64);
+
+    slice value = storage.upgrade_storage:get!("tracking_borrow_index"H);
+    new_storage = new_storage.store_uint(value~load_uint(64), 64);
+ 
+    slice value = storage.upgrade_storage:get!("dutch_auction_start_timestamp"H);
+    new_storage = new_storage.store_uint(value~load_uint(32), 32);
+    
+    slice value = storage.upgrade_storage:get!("backup_cell"H);
+    new_storage = new_storage.store_ref(value~load_ref());
+    
+    return new_storage;
+}

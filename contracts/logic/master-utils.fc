@@ -1,0 +1,250 @@
+#include "../external/stdlib.fc";
+#include "../data/asset-dynamics-packer.fc";
+#include "../storage/user-storage.fc";
+#include "../external/ton.fc";
+#include "utils.fc";
+#include "../constants/constants.fc";
+
+(int, int) get_asset_interests (
+  cell asset_config_collection, cell asset_dynamics_collection,
+  int asset_id
+) {
+  var (asset_s_rate, asset_b_rate, total_supply_principal, total_borrow_principal, last_accrual, asset_balance, _, _, _) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+
+  (int jw_address_hash, int decimals, int collateral_factor, int liquidation_threshold, _, int base_borrow_rate, int borrow_rate_slope_low, int borrow_rate_slope_high, int supply_rate_slope_low, int supply_rate_slope_high, int target_utilization, int origination_fee, int dust, _, int reserve_factor, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(asset_id);
+
+  int total_supply = present_value_supply_calc(asset_s_rate, total_supply_principal);
+  int total_borrow = present_value_borrow_calc(asset_b_rate, total_borrow_principal);
+  int utilization = 0;
+  int supply_interest = 0;
+  int borrow_interest = 0;
+
+  if (total_supply == 0) {
+    utilization = 0;
+  } else {
+    utilization = total_borrow * constants::factor_scale / total_supply;
+  }
+
+  if (utilization <= target_utilization) {
+    borrow_interest = base_borrow_rate
+      + muldiv(borrow_rate_slope_low, utilization, constants::factor_scale);
+  } else {
+    borrow_interest = base_borrow_rate
+      + muldiv(borrow_rate_slope_low, target_utilization, constants::factor_scale)
+      + muldiv(borrow_rate_slope_high, (utilization - target_utilization), constants::factor_scale);
+  }
+
+  supply_interest =
+    borrow_interest
+    .muldiv(utilization, constants::factor_scale)
+    .muldiv(constants::reserve_scale - reserve_factor, constants::reserve_scale);
+  return (supply_interest, borrow_interest);
+}
+
+(int, int) get_current_rates (
+  cell asset_config_collection, cell asset_dynamics_collection,
+  int asset_id, int time_elapsed
+) {
+  var (s_rate, b_rate, total_supply_principal, total_borrow_principal, last_accrual, asset_balance, _, _, _) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+
+  if (time_elapsed > 0) {
+    (int supply_rate, int borrow_rate) = get_asset_interests(asset_config_collection, asset_dynamics_collection, asset_id);
+    int updated_s_rate = s_rate + muldiv(s_rate, supply_rate * time_elapsed, constants::factor_scale);
+    int updated_b_rate = b_rate + muldiv(b_rate, borrow_rate * time_elapsed, constants::factor_scale);
+
+    return (updated_s_rate, updated_b_rate);
+  }
+  return (s_rate, b_rate);
+}
+
+
+(int, int) accrue_tracking_indexes(int tracking_supply_index, int tracking_borrow_index, int last_accrual, int total_supply, int total_borrow, int decimals, int min_principal_for_rewards, int base_tracking_supply_speed, int base_tracking_borrow_speed) inline {
+    if ((now() - last_accrual > 0) & (min_principal_for_rewards > 0)) {
+        ;; we set min_principal_for_rewards to 0 to disable rewards
+        int timeElapsed = now() - last_accrual;
+        if (total_supply >= min_principal_for_rewards) {
+            tracking_supply_index += muldiv(base_tracking_supply_speed * timeElapsed, fast_dec_pow(decimals), total_supply);
+        }
+        if (total_borrow >= min_principal_for_rewards) {
+            tracking_borrow_index += muldiv(base_tracking_borrow_speed * timeElapsed, fast_dec_pow(decimals), total_borrow);
+        }
+    }
+    return (tracking_supply_index, tracking_borrow_index);
+}
+
+(cell) update_master_lm_indexes(cell assets_config_collection, cell dynamics_collection) {
+    cell new_assets_dynamics_collection = new_dict();
+
+    (int asset_id, slice asset_dynamics, int flag) = dynamics_collection.udict_get_min?(256);
+    while (flag) {
+        (
+            int asset_s_rate, int asset_b_rate,
+            int total_supply_principal, int total_borrow_principal,
+            int last_accrual,
+            int token_balance,
+            int old_tracking_supply_index, int old_tracking_borrow_index,
+            int awaited_supply
+        ) = asset_dynamics.unpack_asset_dynamics();
+
+        ;; should exist, `found` is not necessary
+        (slice asset_slice, _) = assets_config_collection.udict_get?(256, asset_id);
+
+        (_, int decimals, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+            int min_principal_for_rewards, int base_tracking_supply_speed, int base_tracking_borrow_speed
+        ) = asset_slice.unpack_asset_config();
+
+        ;; Note Replace after upgrade with proper loads!
+        (int tracking_supply_index, int tracking_borrow_index) = accrue_tracking_indexes(
+            old_tracking_supply_index, old_tracking_borrow_index,
+            last_accrual,
+            total_supply_principal, total_borrow_principal,
+            decimals, min_principal_for_rewards,
+            base_tracking_supply_speed, base_tracking_borrow_speed
+        );
+
+        int time_elapsed = now() - last_accrual;
+        (asset_s_rate, asset_b_rate) = get_current_rates(
+            assets_config_collection, dynamics_collection,
+            asset_id, time_elapsed
+        );
+
+        cell asset_dynamics_new = pack_asset_dynamics(
+            asset_s_rate, asset_b_rate,
+            total_supply_principal, total_borrow_principal,
+            now(), token_balance,
+            tracking_supply_index, tracking_borrow_index,
+            awaited_supply
+        );
+
+        new_assets_dynamics_collection~udict_set(256, asset_id, asset_dynamics_new.begin_parse());
+
+        (asset_id, asset_dynamics, flag) = dynamics_collection.udict_get_next?(256, asset_id);
+    }
+    return new_assets_dynamics_collection;
+}
+
+(cell, ()) update_old_rates_and_provided_asset_id (
+cell asset_dynamics_collection, cell asset_config_collection,
+  int required_asset_id1, int required_asset_id2
+) {
+  (int asset_id, slice asset_dynamics, int flag) = asset_dynamics_collection.udict_get_min?(256);
+  while (flag) {
+    (
+      int asset_s_rate, int asset_b_rate,
+      int total_supply_principal, int total_borrow_principal,
+      int last_accrual, int token_balance,
+      int tracking_supply_index, int tracking_borrow_index,
+      int awaited_supply
+    ) = asset_dynamics.unpack_asset_dynamics();
+
+    int is_required_asset? = (asset_id == required_asset_id1) | (asset_id == required_asset_id2);
+    int time_elapsed = now() - last_accrual;
+    if ((time_elapsed > 0) & ((is_required_asset?) | (time_elapsed > constants::consider_rates_old_after))) {
+        (asset_s_rate, asset_b_rate) = get_current_rates(
+            asset_config_collection, asset_dynamics_collection,
+            asset_id,
+            time_elapsed
+        );
+        ;; Update tracking indexes
+        (_, int decimals, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+            int min_principal_for_rewards, int base_tracking_supply_speed, int base_tracking_borrow_speed
+        ) = asset_config_collection.asset_config_collection:get_unpacked(asset_id);
+
+        (tracking_supply_index, tracking_borrow_index) = accrue_tracking_indexes(
+            tracking_supply_index, tracking_borrow_index, last_accrual,
+            total_supply_principal, total_borrow_principal, decimals,
+            min_principal_for_rewards, ;; < note we need to accrue interests on OLD totals.
+            ;; ^ so, total_supply_principal and total_borrow_principal NOT new_total_supply and new_total_borrow.
+            ;; ^ because we need to calculate rewards for the period from last_accrual_timestamp to now
+            base_tracking_supply_speed, base_tracking_borrow_speed
+        );
+        
+        asset_dynamics_collection~asset_dynamics_collection:set_packed(
+            asset_id,
+            asset_s_rate, asset_b_rate, ;; These are NEW (not unpacked) computed values
+            total_supply_principal, total_borrow_principal,
+            now(), ;; last_accrual updated because s_rate and b_rate are new
+            token_balance, ;; this doesn't change, because withdraw is not yet confirmed
+            tracking_supply_index, tracking_borrow_index,
+            awaited_supply
+        );
+    }
+
+    (asset_id, asset_dynamics, flag) = asset_dynamics_collection.udict_get_next?(256, asset_id);
+  }
+
+  return (asset_dynamics_collection, ());
+}
+
+;; DAO's money
+int get_asset_reserves_direct(
+  int asset_balance,
+  int s_rate, int total_supply_principal,
+  int b_rate, int total_borrow_principal
+) {
+  int total_supply = present_value_supply_calc(s_rate, total_supply_principal);
+  int total_borrow = present_value_borrow_calc(b_rate, total_borrow_principal);
+  return (asset_balance - total_supply + total_borrow);
+}
+
+(int) get_asset_reserves (
+  cell asset_config_collection,
+  cell asset_dynamics_collection,
+  int asset_id
+) {
+  var (_, _, total_supply_principal, total_borrow_principal, last_accrual, asset_balance, _, _, _) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+
+  (int s_rate, int b_rate) = get_current_rates(
+    asset_config_collection, asset_dynamics_collection,
+    asset_id, now() - last_accrual
+  );
+  return get_asset_reserves_direct(
+    asset_balance,
+    s_rate, total_supply_principal,
+    b_rate, total_borrow_principal
+  );
+}
+
+;; Function to calculate how much of specific asset
+;; protocol has available for withdrawing or liquidation
+;;NOTE if we want to set liquidity as supply - borrow then use this function everywhere where i leftet NOTEs  
+int get_asset_liquidity(
+  int total_supply_principal,
+  int total_borrow_principal,
+  int s_rate, int b_rate
+) {
+  int total_supply = present_value_supply_calc(s_rate, total_supply_principal);
+  int total_borrow = present_value_borrow_calc(b_rate, total_borrow_principal);
+  return total_supply - total_borrow;
+}
+;; This ^ formula might look strange, but we get it by subtracting:
+;; asset_balance - developers_money
+;; (substituting developers_money)
+;; = asset_balance - (asset_balance - total_supply + total_borrow)
+;; = total_supply - total_borrow
+
+int get_asset_liquidity_minus_reserves(
+  int total_supply_principal,
+  int total_borrow_principal,
+  int s_rate, int b_rate, int token_balance
+) {
+  int total_supply = present_value_supply_calc(s_rate, total_supply_principal);
+  int total_borrow = present_value_borrow_calc(b_rate, total_borrow_principal);
+  return min(total_supply - total_borrow, token_balance);
+}
+
+(int, int) get_asset_totals (
+  cell asset_config_collection,
+  cell asset_dynamics_collection,
+  int asset_id
+) {
+  var (_, _, total_supply_principal, total_borrow_principal, last_accrual, _, _, _, _) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+
+  (int s_rate, int b_rate) = get_current_rates(
+    asset_config_collection, asset_dynamics_collection,
+    asset_id, now() - last_accrual
+  );
+  int total_supply = present_value_supply_calc(s_rate, total_supply_principal);
+  int total_borrow = present_value_borrow_calc(b_rate, total_borrow_principal);
+  return (total_supply, total_borrow);
+}

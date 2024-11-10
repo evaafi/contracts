@@ -1,0 +1,371 @@
+#include "../storage/master-storage.fc";
+#include "../storage/master-upgrade.fc";
+#include "../external/stdlib.fc";
+#include "../external/ton.fc";
+#include "../data/basic-types.fc";
+#include "../data/asset-dynamics-packer.fc";
+#include "../constants/constants.fc";
+#include "../constants/fees.fc";
+#include "../messages/supply-message.fc";
+#include "../messages/withdraw-message.fc";
+#include "../messages/liquidate-message.fc";
+#include "addr-calc.fc";
+#include "utils.fc";
+#include "master-utils.fc";
+
+(int) getCollateralQuote (
+  int borrow_asset_id, int borrow_liquidate_amount,
+  int collateral_asset_id, cell prices_packed
+) method_id {
+  (_, _, cell asset_config_collection, _, _, _, _, cell asset_dynamics_collection) = master::storage::load();
+  (int result, _) = get_collateral_quote(asset_config_collection,
+    borrow_asset_id, borrow_liquidate_amount, collateral_asset_id, prices_packed);
+  return result;
+}
+
+(int, int) getUpdatedRates (
+  cell asset_config_collection, cell asset_dynamics_collection,
+  int asset_id, int time_elapsed 
+) method_id {
+  return get_current_rates(
+    asset_config_collection, asset_dynamics_collection,
+    asset_id, time_elapsed);
+}
+
+(cell) getUpdatedRatesForAllAssets (int time_elapsed) method_id {
+  (cell meta, cell update_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection) = master::storage::load();
+  (int asset_id, slice asset_dynamics, int flag) = asset_dynamics_collection.udict_get_min?(256);
+  cell rates = new_dict();
+  while (flag) {
+    var (cumulative_supply_rate, cumulative_borrow_rate) = get_current_rates(
+      asset_config_collection, asset_dynamics_collection,
+      asset_id, time_elapsed);
+    slice cumulative_asset_rates = begin_cell()
+      .store_sb_rate(cumulative_supply_rate)
+      .store_sb_rate(cumulative_borrow_rate)
+      .end_cell()
+      .begin_parse();
+    rates~udict_set(256, asset_id, cumulative_asset_rates);
+    (asset_id, asset_dynamics, flag) = asset_dynamics_collection.udict_get_next?(256, asset_id);
+  }
+  return (rates);
+}
+
+(int, int) getAssetRates (int asset_id) method_id {
+  (_, _, cell asset_config_collection, _, _, _, _, cell asset_dynamics_collection) = master::storage::load();
+  var (supply_rate, borrow_rate) = get_asset_interests(asset_config_collection, asset_dynamics_collection, asset_id);
+  return (supply_rate, borrow_rate);
+}
+
+(cell) get_assets_rates () method_id {
+  (cell meta, cell update_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection) = master::storage::load();
+  (int asset_id, slice asset_dynamics, int flag) = asset_dynamics_collection.udict_get_min?(256);
+  cell rates = new_dict();
+  while (flag) {
+    var (supply_rate, borrow_rate) = get_asset_interests(asset_config_collection, asset_dynamics_collection, asset_id);
+    slice asset_rates = begin_cell()
+      .store_sb_rate(supply_rate)
+      .store_sb_rate(borrow_rate)
+      .end_cell()
+      .begin_parse();
+    rates~udict_set(256, asset_id, asset_rates);
+    (asset_id, asset_dynamics, flag) = asset_dynamics_collection.udict_get_next?(256, asset_id);
+  }
+  return (rates);
+}
+
+(int) getAssetReserves (int asset_id) method_id {
+  (_, _, cell asset_config_collection, _, _, _, _, cell asset_dynamics_collection) = master::storage::load();
+  return get_asset_reserves(asset_config_collection, asset_dynamics_collection, asset_id);
+}
+
+(cell) get_assets_reserves () method_id {
+  (cell meta, cell update_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection) = master::storage::load();
+  (int asset_id, slice asset_dynamics, int flag) = asset_dynamics_collection.udict_get_min?(256);
+  cell reserves = new_dict();
+  while (flag) {
+    int reserve = get_asset_reserves(asset_config_collection, asset_dynamics_collection, asset_id);
+    slice asset_reserve = begin_cell().store_int(reserve, 65).end_cell().begin_parse();
+    reserves~udict_set(256, asset_id, asset_reserve);
+    (asset_id,  asset_dynamics, flag) = asset_dynamics_collection.udict_get_next?(256, asset_id);
+  }
+  return (reserves);
+}
+
+(int, int) getAssetTotals (int asset_id) method_id {
+  (_, _, cell asset_config_collection, _, _, _, _, cell asset_dynamics_collection) = master::storage::load();
+  var (total_supply, total_borrow) = get_asset_totals(asset_config_collection, asset_dynamics_collection, asset_id);
+  return (total_supply, total_borrow); 
+}
+
+(cell) getAssetsData () method_id {
+  (cell meta, cell update_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection) = master::storage::load();
+  return (asset_dynamics_collection);
+}
+
+(cell) getAssetsConfig () method_id {
+  (cell meta, cell update_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection) = master::storage::load();
+  return (asset_config_collection);
+}
+
+(cell) getConfig () method_id {
+  slice ds = get_data().begin_parse();
+  cell meta = ds~load_ref();
+  cell upgrade_config = ds~load_ref();
+  cell marketConfig = ds~load_ref();
+  return (begin_cell()
+  .store_ref(meta) ;; meta
+  .store_ref(upgrade_config) ;; upgrade_config
+  .store_ref(marketConfig) ;; config
+  .end_cell());
+}
+
+(cell) getStore () method_id {
+  ;; UPD changed to get entire store ; we can parse it offchain
+  ;; its like getConfig but with asset_dinamics
+  return (get_data());
+}
+
+(cell, cell, cell, cell) getUIVariables () method_id {
+  cell config = getConfig();
+  cell asset_dynamics_collection = getAssetsData();
+  cell assets_rates = get_assets_rates();
+  cell assets_reserves = get_assets_reserves();
+  return (asset_dynamics_collection, config, assets_rates, assets_reserves);
+}
+  
+slice get_user_address(slice owner_address) method_id {
+  return calculate_user_address(BLANK_CODE(), owner_address);
+}
+
+int claim_asset_reserves_min_attachment(int fwd_fee) method_id {
+  int fwd_fee_upper_bound = modest_fwd_fee_estimation(fwd_fee);
+  return
+    ;; 1 message: master -> user or jetton-wallet
+    fwd_fee_upper_bound + 
+    fee::claim_asset_reserves +
+    constants::jetton_send_ton_attachment;
+    ;; ^ asset to claim might be jetton, or might be TON
+    ;; in case of TON, adding jetton-TON-attachment is actually not necessary,
+    ;; but let's not add extra branches to the code for little benefit
+}
+
+cell dummy_supply_user_message() method_id {
+  ;; Most values don't really matter:
+  ;; they just need to be there to occupy space,
+  ;; so we can use this message to call withdraw_min_attachment
+  ;; and estimate the corresponding TON attachment
+  return pack_supply_user_message(
+    1111, ;; query_id
+    22222, ;; asset_id,
+    333333, ;; amount,
+    4444444, ;; s_rate,
+    55555555, ;; b_rate,
+    666666666, ;;dust
+    7777777777, ;; max_token_amount
+    88888888888, ;; total_supply
+    88888888888, ;; total_borrow
+    999999999999, ;; tracking_supply_index
+    88888888888, ;; tracking_borrow_index
+    0,
+    begin_cell().end_cell()
+  );
+}
+
+int supply_min_attachment(int fwd_fee, cell supply_user_message) method_id {
+  int fwd_fee_upper_bound = modest_fwd_fee_estimation(fwd_fee);
+  return
+    ;; 3 messages: master -> user, user -> master
+    2 * fwd_fee_upper_bound +
+    cell_fwd_fee(
+      get_current_workchain(),
+      supply_user_message
+    ) +
+    ;; potential User upgarde
+    fee::user_upgrade +
+    ;; 2 transactions
+    fee::incoming_asset +
+    fee::supply_user +
+    fee::supply_success +
+    fee::log_tx +
+    ;; storage on user
+    fee::min_tons_for_storage;
+}
+
+cell dummy_withdraw_user_message() method_id {
+  (_, _, cell asset_config_collection, _, _, _, _, cell asset_dynamics_collection) = master::storage::load();
+  ;; Most values don't really matter:
+  ;; they just need to be there to occupy space,
+  ;; so we can use this message to call withdraw_min_attachment
+  ;; and estimate the corresponding TON attachment
+  return pack_withdraw_user_message(
+    1111, ;; query_id
+    22222, ;; asset_id,
+    333333, ;; amount,
+    4444444, ;; s_rate,
+    55555555, ;; b_rate,
+    ;; asset_config_collection, asset_dynamics_collection
+    ;; ^ though need to be legit, because they can greatly vary in size
+    asset_config_collection,
+    asset_dynamics_collection,
+    begin_cell().end_cell(),
+     ;; recipient_address,
+    my_address(),
+    0,
+    begin_cell().end_cell()
+    ;; todo do we need to have actual price dict here?
+    ;;todo if we will need this function, then price dict should be here
+  );
+}
+
+int withdraw_min_attachment(int fwd_fee, cell withdraw_user_message) method_id {
+  int fwd_fee_upper_bound = modest_fwd_fee_estimation(fwd_fee);
+  return
+    ;; 4 messages: master -> user | user -> master | master -> user & master -> jetton-wallet
+    ;; The first one contains significantly more info, because it needs to include s/b-rates and prices for all assets,
+    ;; so I use cell_fwd_fee to calculate the forward fee for its content,
+    ;; but I also account for it in fwd_fee_upper_bound multiplier (4, instead of 3), because it also includes state init
+    4 * fwd_fee_upper_bound +
+    cell_fwd_fee(
+      get_current_workchain(),
+      withdraw_user_message
+    ) +
+    ;; potential User upgarde
+    fee::user_upgrade +
+    ;; 5 transactions in the success case
+    fee::withdraw_master +
+    fee::withdraw_user +
+    fee::withdraw_collateralized +
+    fee::log_tx +
+    fee::withdraw_success +
+    constants::jetton_send_ton_attachment +
+    ;; op::withdraw_fail would have a larger fee,
+    ;; but failing doesn't come with sending jettons.
+    ;; Thus, combined fees in the case of success (fee::withdraw_success + constants::jetton_send_ton_attachment)
+    ;; are larger than "fee::withdraw_fail" would have been.
+    ;; Storage on user
+    fee::min_tons_for_storage;
+}
+
+cell dummy_liquidate_user_message() method_id {
+  (_, _, cell asset_config_collection, _, _, _, _, cell asset_dynamics_collection) = master::storage::load();
+  ;; Most values don't really matter:
+  ;; they just need to be there to occupy space,
+  ;; so we can use this message to call withdraw_min_attachment
+  ;; and estimate the corresponding TON attachment
+  return pack_liquidate_user_message(
+    1111, ;; query_id
+    asset_config_collection, asset_dynamics_collection,
+    22222, ;; collateral_asset_id
+    333333, ;; min_collateral_amount
+    my_address(),
+    44444, ;; transferred_asset_id
+    555555, ;; transferred_amount
+    666666, 
+    begin_cell().end_cell(),
+    begin_cell().end_cell()
+  );
+}
+
+int liquidate_min_attachment(int fwd_fee, cell liquidate_user_message) method_id {
+  int fwd_fee_upper_bound = modest_fwd_fee_estimation(fwd_fee);
+  return
+    ;; 4 messages: master -> user | user -> master | master -> user & master -> jetton-wallet
+    ;; The first one contains significantly more info, because it needs to include s/b-rates and prices for all assets,
+    ;; so I use cell_fwd_fee to calculate the forward fee for its content,
+    ;; but I also account for it in fwd_fee_upper_bound multiplier (4, instead of 3), because it also includes state init
+    4 * fwd_fee_upper_bound +
+    cell_fwd_fee(
+      get_current_workchain(),
+      liquidate_user_message
+    ) +
+    ;; potential User upgarde
+    fee::user_upgrade +
+    ;; 5 transactions in the liquidate_satisfied case
+    fee::liquidate_master +
+    fee::liquidate_user +
+    fee::liquidate_satisfied +
+    fee::log_tx +
+    fee::liquidate_fail + 
+    constants::jetton_send_ton_attachment +
+    ;; With liquidation, in case it fails at the last step
+    ;; (on master, because there is not enough liquidity)
+    ;; User fail also consumes more than success (because it reverts)
+    ;; but (unlike withdraw) Master needs to send assets either way
+    ;; (either refund in case of fail, or reward in case of success)
+    ;; so failed branch would have larger total fee
+    ;; Storage on user
+    fee::min_tons_for_storage;
+}
+
+;; nns2009 added for testing/debugging/analysis
+(int, int) get_asset_total_principals(int asset_id) method_id {
+  (_, _, _, _, _, _, _, cell asset_dynamics_collection) = master::storage::load();
+  (_, _, int total_supply_principal, int total_borrow_principal, _, _, _, _, _)
+    = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+  return (total_supply_principal, total_borrow_principal);
+}
+
+int get_asset_balance(int asset_id) method_id {
+  (_, _, _, _, _, _, _, cell asset_dynamics_collection) = master::storage::load();
+  (_, _, _, _, _, int balance, _, _, _) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+  return balance;
+}
+
+int get_asset_liquidity_by_id(int asset_id) method_id {
+  (_, _, _, _, _, _, _, cell asset_dynamics_collection) = master::storage::load();
+  (int s_rate, int b_rate,
+   int total_supply_principal, int total_borrow_principal,
+    _, int asset_balance, _, _, _) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+  ;;NOTE if we want to set liquidity as supply - borrow then uncomment here
+  ;;return get_asset_liquidity(total_supply_principal, total_borrow_principal, s_rate, b_rate);
+  return (asset_balance);
+}
+
+int get_asset_liquidity_minus_reserves_by_id(int asset_id) method_id {
+  (_, _, _, _, _, _, _, cell asset_dynamics_collection) = master::storage::load();
+  (int s_rate, int b_rate,
+   int total_supply_principal, int total_borrow_principal,
+    _, int asset_balance, _, _, _) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+  ;;NOTE if we want to set liquidity as supply - borrow then uncomment here
+  return get_asset_liquidity_minus_reserves(total_supply_principal, total_borrow_principal, s_rate, b_rate, asset_balance);
+}
+
+(int, int) get_asset_sb_rate(int asset_id) method_id {
+  (_, _, _, _, _, _, _, cell asset_dynamics_collection) = master::storage::load();
+  (int s_rate, int b_rate, _, _, _, _, _, _, _) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+  return (s_rate, b_rate);
+}
+
+int get_active() method_id {
+  (_, _, _, int if_active, _, _, _, _) = master::storage::load();
+  return if_active;
+}
+
+(cell) getTokensKeys () method_id {
+  (_, _, _, _, _, _, cell tokens_keys, _) = master::storage::load();
+  return (tokens_keys);
+}
+
+(int) getLastUserScVersion() method_id {
+  (_, cell upgrade_config, _, _, _, _, _, _) = master::storage::load();
+  (
+    int master_version, int user_version,
+    int timeout, int update_time, int freeze_time,
+    cell user_code,
+    cell new_master_code, cell new_user_code
+  ) = unpack_upgrade_config(upgrade_config);
+  return user_version;
+}
+
+(int, int, int, int, int, cell, cell, cell) getUpgradeConfig() method_id {
+  (_, cell upgrade_config, _, _, _, _, _, _) = master::storage::load();
+  return upgrade_config.unpack_upgrade_config();
+}
+
+(int, int, int) get_asset_tracking_info(int asset_id) method_id {
+  (_, _, _, _, _, _, _, cell asset_dynamics_collection) = master::storage::load();
+  (_, _, _, _, int last_accrual, _, int tracking_supply_index, int tracking_borrow_index, _
+  ) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+  return (tracking_supply_index, tracking_borrow_index, last_accrual);
+}

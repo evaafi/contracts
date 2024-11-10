@@ -1,0 +1,59 @@
+#include "../external/stdlib.fc";
+
+(cell) master::storage::pack(
+  cell meta, cell upgrade_config,
+  cell asset_config_collection,
+  int if_active, slice oracles_info, slice admin,
+  cell tokens_keys,  
+  cell asset_dynamics_collection
+) inline {
+  return (
+    begin_cell()
+      .store_ref(meta)
+      .store_ref(upgrade_config)
+      .store_ref(
+        begin_cell()
+          .store_dict(asset_config_collection)
+          .store_int(if_active, 8)
+          .store_slice(admin)
+          .store_slice(oracles_info) ;; uint8 num_oracles, uint8 threshold, ^cell oracles
+          .store_dict(tokens_keys)
+        .end_cell())
+      .store_dict(asset_dynamics_collection)
+      .end_cell()
+  );
+}
+
+() master::storage::save (
+  cell meta, cell upgrade_config,
+  cell asset_config_collection,
+  int if_active, slice oracles_info, slice admin,
+  cell tokens_keys,  
+  cell asset_dynamics_collection
+) impure {
+  set_data(
+    master::storage::pack(
+      meta, upgrade_config, asset_config_collection,
+      if_active, oracles_info, admin, tokens_keys, 
+      asset_dynamics_collection
+    )
+  );
+}
+
+(cell, cell, cell, int, slice, slice, cell, cell) master::storage::load () inline {
+  slice ds = get_data().begin_parse();
+  cell meta = ds~load_ref();
+  cell upgrade_config = ds~load_ref();
+  cell marketConfig = ds~load_ref();
+  slice unpacked_marked_config = marketConfig.begin_parse();
+  cell asset_config_collection = unpacked_marked_config~load_dict();
+  int if_active = unpacked_marked_config~load_int(8);
+  slice admin = unpacked_marked_config~load_msg_addr();
+  slice oracles_info = unpacked_marked_config~load_bits_refs(33, 1);
+  cell tokens_keys = unpacked_marked_config~load_dict();
+  unpacked_marked_config.end_parse();
+  cell asset_dynamics_collection = ds~load_dict();
+  ds.end_parse();
+  return (meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection);
+}
+ 

@@ -1,0 +1,29 @@
+const int fee::min_tons_for_storage = 40000000;
+const int fee::claim_asset_reserves = 30000000;
+
+const int fee::user_upgrade = 60000000;
+
+const int fee::incoming_asset = 45000000; ;; slightly increased to 0.045 due to try-catches, from 0.03
+const int fee::supply_user = 30000000;
+const int fee::supply_success = 40000000;
+const int fee::supply_fail = 40000000;
+const int fee::supply_fail_revert_user = 30000000;
+const int fee::supply_success_revert_user = 30000000;
+const int fee::log_tx = 10000000;
+
+const int fee::withdraw_master = 30000000;
+const int fee::withdraw_user = 30000000;
+const int fee::withdraw_collateralized = 35000000;
+const int fee::withdraw_success = 30000000;
+const int fee::withdraw_fail = 30000000;
+
+const int fee::liquidate_master = 30000000;
+const int fee::liquidate_user_message = 15000000;
+const int fee::liquidate_user = 40000000;
+const int fee::liquidate_unsatisfied = 30000000;
+const int fee::liquidate_satisfied = 45000000;
+const int fee::liquidate_success = 30000000;
+const int fee::liquidate_fail = 30000000;
+
+const int fee::revert_call = 35000000;
+

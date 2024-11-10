@@ -1,0 +1,251 @@
+#include "../external/stdlib.fc";
+#include "../constants/errors.fc";
+#include "../constants/logs.fc";
+#include "../data/asset-dynamics-packer.fc";
+#include "../data/basic-types.fc";
+#include "../messages/withdraw-message.fc";
+#include "../logic/addr-calc.fc";
+#include "../logic/master-get-methods.fc";
+#include "../logic/tx-utils.fc";
+#include "../logic/utils.fc";
+
+cell master_core_logic_withdraw (
+  int user_version, cell user_code,
+  cell asset_config_collection, cell asset_dynamics_collection,
+  int msg_value, int fwd_fee,
+  slice owner_address, int asset_id, int amount, int query_id, cell prices_packed, slice recipient_address,
+  int forward_ton_amount, cell custom_response_payload
+) impure {
+  asset_dynamics_collection~update_old_rates_and_provided_asset_id(
+    asset_config_collection,  asset_id, 0
+  );
+
+  (int s_rate, int b_rate, _, _, _, _, _, _, _) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+
+  cell withdraw_user_message = pack_withdraw_user_message(
+    query_id,
+    asset_id, amount,
+    s_rate, b_rate,
+    asset_config_collection, asset_dynamics_collection, prices_packed, recipient_address,
+    forward_ton_amount, custom_response_payload
+  );
+
+  int enough_fee = withdraw_min_attachment(fwd_fee, withdraw_user_message) + forward_ton_amount;
+  throw_unless(
+    error::withdraw_master_transaction_fees,
+    msg_value >= enough_fee
+  );
+
+  send_message_to_lending_wallet(
+    BLANK_CODE(), user_version, user_code, owner_address,
+    withdraw_user_message, sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
+  );
+
+  return asset_dynamics_collection;
+}
+
+() withdraw_master_process (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+  (int asset_id, int amount, slice recipient_address, int include_user_code, cell prices_packed, int forward_ton_amount, cell custom_response_payload) = parse_withdraw_master_message(in_msg_body);
+
+  throw_unless(error::invalid_address_provided, is_valid_address?(recipient_address));
+  throw_unless(error::custom_response_payload_too_big, is_valid_custom_response_payload?(custom_response_payload));
+
+  if (~ prices_packed.null?()) {
+    int prices_error_code = prices_packed~prices_packed:error(oracles_info);
+    throw_if(prices_error_code, prices_error_code); ;; non-zero codes throw
+  }
+  
+  (_, int user_version, _, _, _, cell user_code, _, _) = upgrade_config.unpack_upgrade_config();
+  
+  asset_dynamics_collection = master_core_logic_withdraw(
+    user_version, include_user_code ? user_code : null(),
+    asset_config_collection, asset_dynamics_collection,
+    msg_value, fwd_fee,
+    sender_address, asset_id,
+    amount, query_id,
+    prices_packed, recipient_address,
+    forward_ton_amount, custom_response_payload
+  );
+
+  ;; The only reason we save is to update s/b-rate of the corresponding asset
+  ;; this is just a request to withdraw, no confirmation yet,
+  ;; so no amounts change
+  master::storage::save(
+    meta, upgrade_config,
+    asset_config_collection, 
+    if_active, oracles_info, admin, tokens_keys, 
+    asset_dynamics_collection
+  );
+  return ();
+}
+
+() withdraw_collateralized_process  (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+  (slice owner_address, int asset_id, int withdraw_amount_current, int user_new_principal,
+    int borrow_amount_principal, int reclaim_amount_principal, slice recipient_address, int forward_ton_amount, cell custom_response_payload)
+    = parse_withdraw_collateralized_message(in_msg_body);
+
+  ;; Verify this is a message from lending-user smart contract
+  
+  int user_version = upgrade_config.upgrade_config:user_code_version();
+  throw_unless(
+    error::withdraw_collateralized_fake_sender,
+    slice_data_equal?(
+      sender_address,
+      calculate_user_address(BLANK_CODE(), owner_address)
+    )
+  );
+
+  (int s_rate, int b_rate,
+   int total_supply_principal, int total_borrow_principal,
+   int last_accrual, int token_balance, int tracking_supply_index, int tracking_borrow_index,
+   int awaited_supply
+  )
+    = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+
+  int asset_liquidity_minus_reserves = get_asset_liquidity_minus_reserves(
+    total_supply_principal, total_borrow_principal,
+    s_rate, b_rate, token_balance
+  );
+
+  int asset_liquidity = token_balance;
+  int borrow_amount_present = present_value_borrow_calc(b_rate, borrow_amount_principal);
+
+  ;; Above is the more sofisticated formula from Vlad and below is the corresponding check:
+  ;; it accounts for developer's money, and doesn't allow to withdraw using devs' funds
+  ;; My original (intuitive) check was: withdraw_amount_current > token_balance
+  if ((withdraw_amount_current > asset_liquidity) | (borrow_amount_present > asset_liquidity_minus_reserves)) {
+    ;; User withdraw request is collateralized, but unfortunately ...
+    ;; we just DON'T have enough of the corresponding token to send it
+    ;; "No money, but hang on"
+
+    ;; We need to send op::withdraw_fail message to the user smart contract to:
+    ;; a) Let it unlock itself
+    ;; b) Make it revert it's corresponding principal balance
+    ;; c) Make it refund TON attachment excess
+    send_message_to_lending_wallet_by_address(
+      null(), 0, ;; state_init don't need
+      user_version, null(), ;; null upgrade_info
+      sender_address, pack_withdraw_fail_message(
+        query_id, asset_id,
+        borrow_amount_principal + reclaim_amount_principal
+      ), sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
+    );
+
+    ;; Consider refund fee excesses
+    ;; Added: I thought all refunding had been already done
+    ;; More added: yes, it was done, the fee-refund happens on User at op::withdraw_fail
+  } else {
+    ;; User withdraw request is collateralized
+    ;; and we HAVE enough of asset to satisfy it
+    int new_total_supply = total_supply_principal - reclaim_amount_principal;
+    int new_total_borrow = total_borrow_principal + borrow_amount_principal;
+
+    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _
+    ) = asset_config_collection.asset_config_collection:get_unpacked(asset_id);
+
+    asset_dynamics_collection~asset_dynamics_collection:set_packed(
+      asset_id,
+      s_rate, b_rate,
+      new_total_supply, new_total_borrow,
+      last_accrual, token_balance - withdraw_amount_current,
+      tracking_supply_index, tracking_borrow_index,
+      awaited_supply
+    );
+
+    ;; msg_value -= fee::withdraw_collateralized;
+
+    int success_message_fee =
+      modest_fwd_fee_estimation(fwd_fee) + fee::withdraw_success;
+    msg_value -= success_message_fee;
+    msg_value -= fee::log_tx;
+
+    ;; We also need to send op::withdraw_success message to the user smart contract
+    ;; to let it unlock itself
+
+    send_message_to_lending_wallet_by_address(
+      null(), success_message_fee, ;; state_init don't need
+      user_version, null(), ;; null upgrade_info
+      sender_address, pack_withdraw_success_message(
+        query_id, asset_id, borrow_amount_principal + reclaim_amount_principal,
+        tracking_supply_index, tracking_borrow_index
+      ), sendmode::REGULAR
+    );
+  
+    cell log_data = begin_cell()
+      .store_uint(log::withdraw_success, 8) ;; withdraw code
+      .store_slice(owner_address) ;; user addr
+      .store_slice(sender_address) ;; user sc addr
+      .store_slice(recipient_address) ;; recipient_address 
+      .store_uint(now(), 32) ;; current time
+      .store_ref(begin_cell().end_cell()) ;; supply asset data (nothic cause its withdraw)
+      .store_ref(begin_cell() ;; attached redeemed asset data
+        .store_uint(asset_id, 256) 
+        .store_uint(withdraw_amount_current, 64) 
+        .store_int(user_new_principal, 64) 
+        .store_int(new_total_supply, 64) 
+        .store_int(new_total_borrow, 64) 
+        .store_uint(s_rate, 64) 
+        .store_uint(b_rate, 64) 
+        .end_cell())
+      .end_cell();
+
+    emit_log_simple(log_data);
+
+    if (asset_id == constants::ton_asset_id){
+      ;; N.B. forward_ton_amount is contained in msg_value, because it is enforced in enough_fee
+      raw_reserve(my_balance - withdraw_amount_current - msg_value, reserve::REGULAR);
+    } else {
+      raw_reserve(0, 4);
+    }
+
+    send_asset_ext(
+      recipient_address, query_id,
+      jw_address_hash, withdraw_amount_current,
+      forward_ton_amount,
+      pack_withdraw_excess_message_with_data(op::withdraw_success, query_id, custom_response_payload),
+      sendmode::CARRY_ALL_BALANCE 
+    );
+
+    master::storage::save(
+      meta, upgrade_config,
+      asset_config_collection, 
+      if_active, oracles_info, admin, tokens_keys, 
+      asset_dynamics_collection
+    );
+  }
+  ;; We only accept op::withdraw_collateralized from lending-user smart contracts,
+  ;; which means the corresponding lending-user smart contract
+  ;; had already been initialized by the point we received this message,
+  ;; which means it's fine not to include deploy info (state-init) in the message
+  ;; and just use send_message (instead of send_message_to_lending_wallet)
+  ;; to have a lighter message
+  return ();
+}
+
+() withdraw_collateralized_handle_exception  (
+  slice in_msg_body, slice sender_address, cell upgrade_config, int query_id
+) impure inline {
+  (_, int asset_id, _, _, int borrow_amount_principal, int reclaim_amount_principal, _, _, _)
+    = parse_withdraw_collateralized_message(in_msg_body);
+
+  int user_version = upgrade_config.upgrade_config:user_code_version();
+
+  send_message_to_lending_wallet_by_address(
+    null(), 0, ;; state_init don't need
+    user_version, null(), ;; null upgrade_info
+    sender_address, pack_withdraw_fail_message(
+      query_id, asset_id,
+      borrow_amount_principal + reclaim_amount_principal
+    ), sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
+  );
+}

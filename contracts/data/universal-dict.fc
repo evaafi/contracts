@@ -1,0 +1,9 @@
+#include "../external/stdlib.fc";
+#include "../constants/errors.fc";
+
+slice upgrade_storage:get!(cell storage, int field_name_hash) impure inline {
+	(slice value, int found) = storage.udict_get?(256, field_name_hash);
+	throw_unless(error::unexpected_empty_value, found);
+	return value;
+}
+

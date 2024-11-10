@@ -1,0 +1,14 @@
+#include "../external/stdlib.fc";
+#include "../data/basic-types.fc";
+
+(slice, int, int) parse_claim_asset_reserves_message(slice cs) {
+	slice target_address = cs~load_msg_addr();
+	int asset_id = cs~load_asset_id();
+	int amount_to_claim = cs~load_amount();
+	cs.end_parse();
+	return (
+		target_address,
+		asset_id, amount_to_claim
+	);
+}
+

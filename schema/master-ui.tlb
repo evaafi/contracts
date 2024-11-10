@@ -1,0 +1,163 @@
+// This file is licensed under the Business Source License (BUSL).
+// See the LICENSE.md file in the project root for more information.
+
+// Bool in get-methods must be represented as int. 0 = false, -1 = true.
+
+// Method name: getCollateralQuote
+// In args: (borrow_asset_id: int, borrow_liquidate_amount: int, collateral_asset_id: int, prices_packed: PricesPacked)
+// Out values: (collateral_quote: int)
+get_collateral_quote$_ collateral_quote:int256 = GetMethodResult;
+
+// Method name: getUpdatedRates
+// In args: (asset_config_collection: AssetConfigCollection, asset_dynamics_collection: AssetDynamicsCollection, asset_id: int, time_elapsed: int)
+// Out values: (s_rate: int, b_rate: int)
+get_updated_rates$_ rates:AssetRate = GetMethodResult;
+
+// Method name: getUpdatedRatesForAllAssets
+// In args: (time_elapsed: int)
+// Out values: (rates: (HashmapE 256 AssetRate))
+get_updated_rates_for_all_assets$_ rates:(HashmapE 256 AssetRate) = GetMethodResult;
+
+// Method name: getAssetRates
+// In args: (asset_id: int)
+// Out values: (supply_rate: int, borrow_rate: int)
+get_asset_rates$_ rates:AssetRate = GetMethodResult;
+
+// Method name: get_assets_rates
+// In args: ()
+// Out values: (rates: (HashmapE 256 AssetRate))
+get_assets_rates$_ rates:(HashmapE 256 AssetRate) = AssetRatesGetMethodResult;
+// AssetRatesGetMethodResult = GetMethodResult;
+
+// Method name: getAssetReserves
+// In args: (asset_id: int)
+// Out values: (asset_reserve: int)
+get_asset_reserves$_ value:int256 = GetMethodResult;
+
+// Method name: get_assets_reserves
+// In args: ()
+// Out values: (reserves: (HashmapE 256 int65))
+get_assets_reserves$_ reserves:(HashmapE 256 int65) = AssetReservesGetMethodResult;
+// AssetReservesGetMethodResult = GetMethodResult;
+
+// Method name: getAssetTotals
+// In args: (asset_id: int)
+// Out values: (total_supply: int, total_borrow: int)
+get_asset_totals$_ total_supply:int256 total_borrow:int256 = GetMethodResult;
+
+// Method name: getAssetsData
+// In args: ()
+// Out values: (asset_dynamics_collection: AssetDynamicsCollection)
+get_assets_data$_ asset_dynamics_collection:AssetDynamicsCollection = GetMethodResult;
+
+// Method name: getAssetsConfig
+// In args: ()
+// Out values: (asset_config_collection: AssetConfigCollection)
+get_assets_config$_ asset_config_collection:AssetConfigCollection = GetMethodResult;
+
+// Method name: getConfig
+// In args: ()
+// Out values: (meta: Cell, upgrade_config: UpgradeConfig, master_config: MasterConfig)
+get_config$_ meta:^Cell upgrade_config:^UpgradeConfig master_config:^MasterConfig = ConfigGetMethodResult; // in-cell description
+// ConfigGetMethodResult = GetMethodResult;
+
+// Method name: getStore
+// In args: ()
+// Out values: (storage: MasterStorage)
+get_store$_ storage:MasterStorage = GetMethodResult;
+
+// Method name: getUIVariables
+// In args: ()
+// Out values: (asset_dynamics_collection: AssetDynamicsCollection, config: ConfigGetMethodResult, assets_rates: AssetRatesGetMethodResult, assets_reserves: AssetReservesGetMethodResult)
+get_ui_variables$_ asset_dynamics_collection:AssetDynamicsCollection config:ConfigGetMethodResult
+    assets_rates:AssetRatesGetMethodResult assets_reserves:AssetReservesGetMethodResult = GetMethodResult;
+
+// Method name: get_user_address
+// In args: (owner_address: MsgAddressInt)
+// Out values: (user_address: MsgAddressInt)
+get_user_address$_ user_address:MsgAddressInt = GetMethodResult;
+
+// Method name: claim_asset_reserves_min_attachment
+// In args: (fwd_fee: int)
+// Out values: (min_attachment_amount: int)
+claim_asset_reserves_min_attachment$_ amount:int256 = GetMethodResult;
+
+// Method name: dummy_supply_user_message
+// In args: ()
+// Out values: (supply_user: UserCommand)
+dummy_supply_user_message$_ supply_user:UserCommand = GetMethodResult;
+
+// Method name: supply_min_attachment
+// In args: (fwd_fee: int, supply_user_message: UserCommand)
+// Out values: (min_attachment_amount: int)
+supply_min_attachment$_ amount:int256 = GetMethodResult;
+
+// Method name: dummy_withdraw_user_message
+// In args: ()
+// Out values: (withdraw_user: UserCommand)
+dummy_withdraw_user_message$_ withdraw_user:UserCommand = GetMethodResult;
+
+// Method name: withdraw_min_attachment
+// In args: (fwd_fee: int, withdraw_user_message: UserCommand)
+// Out values: (min_attachment_amount: int)
+withdraw_min_attachment$_ amount:int256 = GetMethodResult;
+
+// Method name: dummy_liquidate_user_message
+// In args: ()
+// Out values: (liquidate_user: UserCommand)
+dummy_liquidate_user_message$_ liquidate_user:UserCommand = GetMethodResult;
+
+// Method name: liquidate_min_attachment
+// In args: (fwd_fee: int, liquidate_user_message: UserCommand)
+// Out values: (min_attachment_amount: int)
+liquidate_min_attachment$_ amount:int256 = GetMethodResult;
+
+// Method name: get_asset_total_principals
+// In args: (asset_id: int)
+// Out values: (total_supply_principal: int, total_borrow_principal: int)
+get_asset_total_principals$_ total_supply_principal:int256 total_borrow_principal:int256 = GetMethodResult;
+
+// Method name: get_asset_balance
+// In args: (asset_id: int)
+// Out values: (balance: int)
+get_asset_balance$_ balance:int256 = GetMethodResult;
+
+// Method name: get_asset_liquidity_by_id
+// In args: (asset_id: int)
+// Out values: (liquidity: int)
+get_asset_liquidity_by_id$_ liquidity:int256 = GetMethodResult;
+
+// Method name: get_asset_liquidity_minus_reserves_by_id
+// In args: (asset_id: int)
+// Out values: (liquidity: int)
+get_asset_liquidity_minus_reserves_by_id$_ liquidity_minus_reserves:int256 = GetMethodResult;
+
+// Method name: get_asset_sb_rate
+// In args: (asset_id: int)
+// Out values: (supply_rate: int, borrow_rate: int)
+get_asset_sb_rate$_ supply_rate:int256 borrow_rate:int256 = GetMethodResult;
+
+// Method name: get_active
+// In args: ()
+// Out values: (if_active: Bool)
+get_active$_ if_active:Bool = GetMethodResult;
+
+// Method name: getTokensKeys
+// In args: ()
+// Out values: (tokens_keys: Cell)
+get_tokens_keys$_ tokens_keys:^Cell = GetMethodResult;
+
+// Method name: getLastUserScVersion
+// In args: ()
+// Out values: (version: int)
+get_last_user_sc_version$_ version:int256 = GetMethodResult;
+
+// Method name: getUpgradeConfig
+// In args: ()
+// Out values: (master_code_version: int, user_code_version: int, timeout: int, update_time: int, freeze_time: int, user_code: Cell, blank_code: Cell, new_master_code: (Maybe Cell), new_user_code: (Maybe Cell))
+get_upgrade_config$_ upgrade_config:UpgradeConfig = GetMethodResult;
+
+// Method name: get_asset_tracking_info
+// In args: (asset_id: int)
+// Out values: (tracking_supply_index: int, tracking_borrow_index: int, last_accrual: int)
+get_asset_tracking_info$_ tracking_supply_index:int256 tracking_borrow_index:int256 last_accrual:int256 = GetMethodResult;

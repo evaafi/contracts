@@ -1,0 +1,24 @@
+const int constants::factor_scale = 1000000000000; ;; = 10^12
+
+const int constants::asset_coefficient_scale = 10000;
+const int constants::price_scale = 1000000000;
+const int constants::ton_asset_id = 0x1a4219fe5e60d63af2a3cc7dce6fec69b45c6b5718497a6148e7c232ac87bd8a; ;; sha256('TON')
+const int constants::jetton_send_ton_attachment = 50000000; ;; 0.05 TON
+const int constants::origination_fee_scale = 1000000000; ;; 10^9
+const int constants::tracking_index_scale = 1000000000000; ;; 10^12
+
+const int constants::reserve_scale = 10000;
+const int constants::reserve_liquidation_scale = 10000;
+
+const int constants::max_uint64 = 0xFFFFFFFFFFFFFFFF;
+const int constants::is_this_current_rollout = -1; ;; means that logic that will update sc on 5.01 will be executed
+
+const int constants::custom_response_payload_max_cells = 5;
+const int constants::upgrade_freeze_time = 30;
+
+const int constants::consider_rates_old_after = 1800; ;; 30 minutes
+
+const int ret::continue_execution = 0;
+const int ret::stop_execution    = -1;
+
+cell BLANK_CODE () asm "B{b5ee9c72c1010e0100fd000d12182a555a6065717691969efd0114ff00f4a413f4bcf2c80b010202c8050202039f740403001ff2f8276a2687d2018fd201800f883b840051d38642c678b64e4400780e58fc10802faf07f80e59fa801e78b096664c02078067c07c100627a7978402014807060007a0ddb0c60201c709080013a0fd007a026900aa90400201200b0a0031b8e1002191960aa00b9e2ca007f4042796d225e8019203f6010201200d0c000bf7c147d2218400b9d10e86981fd201840b07f8138d809797976a2687d2029116382f970fd9178089910374daf81b619fd20182c7883b8701981684100627910eba56001797a6a6ba610fd8200e8768f76a9f6aa00cc2a32a8292878809bef2f1889f883bbcdeb86f01} B>boc PUSHREF";

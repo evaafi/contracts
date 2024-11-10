@@ -1,0 +1,135 @@
+#include "external/stdlib.fc";
+#include "external/ton.fc";
+
+;; should not be changed
+#include "constants/op-codes.fc";
+#include "constants/errors.fc";
+#include "data/basic-types.fc";
+
+;; copypasted this code from /messages/upgrade-header.fc to prevent changes on blank fc code
+(slice, (int, cell, int)) user::upgrade::load_header(slice cs) {
+	int user_version = cs~load_coins();
+	cell upgrade_info = cs~load_maybe_ref();
+	int upgrade_exec = cs~load_bool_ext();
+
+	return (cs,
+		(user_version, upgrade_info,
+		upgrade_exec)
+	);
+}
+
+;; copypasted this code from /locig/tx-utils.fc to prevent changes on blank fc code
+;; https://docs.ton.org/develop/smart-contracts/messages
+() send_message(
+	slice to_address, int nano_ton_amount,
+	cell content, int mode
+) impure {
+	var msg = begin_cell()
+		.store_uint(0x10, 6) 
+		;; ??? Sends non-bounceable. Does it need to be a parameter?
+		.store_slice(to_address)
+		.store_grams(nano_ton_amount)
+		.store_uint(0, 1 + 4 + 4 + 64 + 32 + 1)
+		.store_maybe_ref(content); ;; body:(Either X ^X)
+
+	send_raw_message(msg.end_cell(), mode);
+}
+;; Storage scheme
+;; storage#_ platform_address:MsgIntAddress type_id:uint8 params:^Cell = Storage;
+
+(slice) on_upgrade(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure method_id (0x137) {
+    return in_msg_body;
+}
+
+() revert_call(
+    slice sender_address, slice owner_address,
+    slice in_msg_body
+) impure method_id(0x770) {
+  send_message(
+    sender_address,
+    0,
+    begin_cell()
+    .store_op_code(op::revert_call) ;; 32
+    .store_query_id(99999999) ;; 64
+    .store_slice(owner_address) ;; 3+8+256
+    ;; Part above is totalling: 32 + 64 + 3+8+256 = 363 bits,
+    ;; which is significant -> Let's keep in_msg_body in a separate cell
+    .store_ref(
+        begin_cell().store_slice(in_msg_body).end_cell()
+    )
+    .end_cell(),
+    sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
+  );
+  commit();
+  throw(error::user_code_version_mismatch);
+}
+
+
+;; I don't even know if we need to have sender_address as a parameter,
+;; because Blank/User only accepts messages from master_address,
+;; so sender_address == master_address (which is available through storage)
+;; and it will stay this way at the very least on Blank.
+;; It is theoretically possible to loosen this requirement in the future:
+;; only requiring the first request to User to be sent from Master
+;; (which would upgrade User contract to accept not just Master's messages),
+;; but I don't immediately see a decent use-case for it
+() handle_transaction(
+    slice sender_address, slice in_msg_body_original,
+    int my_balance, int msg_value, cell in_msg_full, slice in_msg_body
+) impure method_id(0x777) {
+  ;; How did we even end up here?
+  ;; We shouldn't have ...
+  slice ds = get_data().begin_parse();
+  ds~load_msg_addr(); ;; master_address
+  slice owner_address = ds~load_msg_addr();
+
+  ;; ... Blank MUST always update before handle_transaction is executed,
+  ;; but we are here, so lets at least revert
+  revert_call(sender_address, owner_address, in_msg_body_original);
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  slice sender_address = cs~load_msg_addr();
+
+  throw_if(error::bounced_on_blank, flags & 1);
+  ;; Bounced message received
+  ;; That was not supposed to happen
+  ;; Something went wrong
+
+  slice ds = get_data().begin_parse();
+  slice master_address = ds~load_msg_addr();
+  throw_unless(error::message_not_from_master,
+      slice_data_equal?(sender_address, master_address)
+  );
+
+  slice in_msg_body_original = in_msg_body;
+
+  (_, cell upgrade_info_cell, int upgrade_exec
+  ) = in_msg_body~user::upgrade::load_header();
+
+  if (upgrade_info_cell.null?()) {
+      slice owner_address = ds~load_msg_addr();
+      revert_call(sender_address, owner_address, in_msg_body_original);
+      return ();
+  }
+  slice upgrade_info = upgrade_info_cell.begin_parse();
+  throw_unless(error::broken_upgrade_info, upgrade_info.slice_refs() == 2);
+  cell new_code = upgrade_info~load_ref();
+  cell new_data = upgrade_info.preload_ref();
+
+  set_code(new_code);
+  set_c3(new_code.begin_parse().bless());
+  set_data(new_data);
+
+  if (upgrade_exec) { ;; upgrade executes if true
+      in_msg_body = on_upgrade(my_balance, msg_value, in_msg_full, in_msg_body);
+  }
+
+  handle_transaction(
+      sender_address, in_msg_body_original,
+      my_balance, msg_value, in_msg_full, in_msg_body
+  );
+  return ();
+}

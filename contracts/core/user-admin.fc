@@ -1,0 +1,35 @@
+#include "../external/stdlib.fc";
+#include "../storage/user-storage.fc";
+#include "../messages/idle-message.fc";
+#include "../logic/tx-utils.fc";
+
+() debug_principals_edit_user_process (
+  slice sender_address, slice in_msg_body_original, int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; handle_transaction params
+  int code_version, slice master_address, slice owner_address, cell user_principals, int state, cell user_rewards, cell backup_cell_1, cell backup_cell_2, ;; user storage params
+  int op, int query_id ;; tx body params
+) impure inline {
+  cell new_principals = in_msg_body~load_dict();
+  user::storage::save(code_version, master_address, owner_address, new_principals, state,   user_rewards, backup_cell_1, backup_cell_2);
+  return ();
+}
+
+() idle_user_process (
+  slice sender_address, slice in_msg_body_original, int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; handle_transaction params
+  int code_version, slice master_address, slice owner_address, cell user_principals, int state, cell user_rewards, cell backup_cell_1, cell backup_cell_2, ;; user storage params
+  int op, int query_id ;; tx body params
+) impure inline {
+  ;; Nothing happens here
+  ;; this op code is added just for upgrade without executing anything
+  (cell tokens_keys, slice originator_address) = parse_idle_user_message(in_msg_body);
+  ;; The only reason we even need originator_address
+  ;; is to refund remaining TONs, but even that is optional
+
+  send_message(
+    originator_address, 0,
+    pack_idle_excess_message(query_id),
+    sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE + 2 ;; +2 - Ignore errors of sending
+    ;; In case there aren't enough TONs to send the message,
+    ;; it doesn't matter - the main thing is contract upgrade
+  );
+  return ();
+}

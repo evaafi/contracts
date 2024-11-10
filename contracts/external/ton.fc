@@ -1,0 +1,33 @@
+#include "stdlib.fc";
+;; Functions, which are common for TON in general
+
+forall X -> int cast_to_int(X x) asm "NOP";
+
+(int) get_current_workchain () {
+	var (wc, _) = parse_std_addr(my_address());
+	return (wc);
+}
+
+;; Based on:
+;; https://github.com/ton-blockchain/token-contract/blob/main/misc/forward-fee-calc.fc#L6
+const int cant_have_this_many_cells = 1 << 64;
+int cell_fwd_fee(int wc, cell content) impure inline {
+	throw_unless(107, (wc == -1) | (wc == 0) );
+	int config_index = 25 + wc;
+	slice cfg = config_param(config_index).begin_parse().skip_bits(8);
+	int lump_price = cfg~load_uint(64);
+	int bit_price = cfg~load_uint(64);
+	int cell_price = cfg~load_uint(64);
+
+	(int cells, int bits, _) = compute_data_size(content, cant_have_this_many_cells);
+	cells -= 1;
+	bits -= content.begin_parse().slice_bits();
+
+	return lump_price + ((bits * bit_price + cells * cell_price + 65535) >> 16 );
+}
+
+int modest_fwd_fee_estimation(int fwd_fee) {
+	return muldiv(fwd_fee, 3, 2);
+	;; we use message fwd_fee for estimation of other similar-sized messages' costs
+}
+

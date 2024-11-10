@@ -1,0 +1,177 @@
+#include "../external/ton.fc";
+#include "../data/basic-types.fc";
+#include "../constants/op-codes.fc";
+#include "../external/stdlib.fc";
+
+;; --------------- op::withdraw_master ---------------
+
+(int, int, slice, int, cell, int, cell) parse_withdraw_master_message(slice cs) {
+	int asset_id = cs~load_asset_id();
+	int amount = cs~load_amount();
+	slice recipient_addr = cs~load_msg_addr();
+	int include_user_code = cs~load_bool_ext();
+	int forward_ton_amount = cs~load_amount();
+	cell custom_response_payload = cs~load_ref();
+	cell prices_with_signature_packed = cs~load_ref();
+	cs.end_parse();
+
+	if (prices_with_signature_packed.begin_parse().slice_empty?()){
+		return (asset_id, amount, recipient_addr, include_user_code, null(), forward_ton_amount, custom_response_payload);
+	}
+
+	return (asset_id, amount, recipient_addr, include_user_code, prices_with_signature_packed, forward_ton_amount, custom_response_payload);
+}
+
+;; --------------- op::withdraw_user ---------------
+
+;; ??? Should we send s/b-rate separately?, since it's obtainable from the asset_dynamics_collection
+cell pack_withdraw_user_message(
+	int query_id,
+	int asset_id, int withdraw_amount_current,
+	int s_rate, int b_rate,
+	cell asset_config_collection, cell asset_dynamics_collection,
+	cell prices_packed, slice recipient_address,
+	int forward_ton_amount, cell custom_response_payload
+) {
+	return begin_cell()
+		.store_op_code(op::withdraw_user) ;; 32
+		.store_query_id(query_id) ;; 64
+		.store_asset_id(asset_id) ;; 256
+		.store_amount(withdraw_amount_current) ;; 64
+		.store_sb_rate(s_rate) ;; 64
+		.store_sb_rate(b_rate) ;; 64
+		.store_slice(recipient_address) ;; 267
+		.store_ref(
+			begin_cell()
+				.store_dict(asset_config_collection) ;; 1
+				.store_dict(asset_dynamics_collection) ;; 1
+				.store_dict(prices_packed) 
+				.store_amount(forward_ton_amount)
+				.store_ref(custom_response_payload)
+				.end_cell())
+		.end_cell();
+}
+
+(int, int, int, int, slice, cell, cell, cell, int, cell) parse_withdraw_user_message(slice cs) {
+	slice rest = cs.preload_ref().begin_parse();
+	return (
+		cs~load_asset_id(),
+		cs~load_amount(),
+		cs~load_sb_rate(),
+		cs~load_sb_rate(),
+		cs~load_msg_addr(),
+		rest~load_dict(),
+		rest~load_dict(),
+		rest~load_dict(),
+		rest~load_amount(),
+		rest~load_ref()
+	);
+}
+
+;; --------------- op::withdraw_collateralized ---------------
+
+cell pack_withdraw_collateralized_message(
+	int query_id,
+	slice owner_address, int asset_id,
+	int withdraw_amount_current, int user_new_principal,
+	int borrow_amount_principal, int reclaim_amount_principal, slice recipient_address,
+	int forward_ton_amount, cell custom_response_payload
+) {
+	return begin_cell()
+		.store_op_code(op::withdraw_collateralized)
+		.store_query_id(query_id)
+		.store_slice(owner_address)
+		.store_asset_id(asset_id)
+		.store_amount(withdraw_amount_current)
+		.store_principal(user_new_principal)
+		.store_principal(borrow_amount_principal)
+		.store_principal(reclaim_amount_principal)
+		.store_ref(
+			begin_cell()
+				.store_slice(recipient_address)
+				.store_amount(forward_ton_amount)
+				.store_ref(custom_response_payload)
+				.end_cell())
+		.end_cell();
+}
+
+(slice, int, int, int, int, int, slice, int, cell) parse_withdraw_collateralized_message(slice cs) {
+	slice rest = cs.preload_ref().begin_parse();
+	return (
+		cs~load_msg_addr(), ;; owner_address
+		cs~load_asset_id(),
+		cs~load_amount(),
+		cs~load_principal(),
+		cs~load_principal(),
+		cs~load_principal(),
+		rest~load_msg_addr(), ;; recipient_address
+		rest~load_amount(),
+		rest~load_ref() ;; custom_response_payload
+	);
+}
+
+;; --------------- op::withdraw_success ---------------
+
+builder pack_withdraw_success_message(
+	int query_id, int asset_id, int principal_amount,
+    int tracking_supply_index, int tracking_borrow_index
+) {
+	return begin_cell()
+		.store_op_code(op::withdraw_success)
+		.store_query_id(query_id)
+		.store_asset_id(asset_id)
+		.store_principal(principal_amount)
+		.store_tracking_index(tracking_supply_index)
+		.store_tracking_index(tracking_borrow_index);
+}
+
+(int, int, int, int) parse_withdraw_success_message(slice cs) {
+	return (
+		cs~load_asset_id(),
+		cs~load_principal(),
+		cs~load_tracking_index(),
+		cs~load_tracking_index()
+	);
+}
+
+;; --------------- op::withdraw_fail ---------------
+
+builder pack_withdraw_fail_message(
+	int query_id, int asset_id, int principal_amount
+) {
+	return begin_cell()
+		.store_op_code(op::withdraw_fail)
+		.store_query_id(query_id)
+		.store_asset_id(asset_id)
+		.store_principal(principal_amount);
+}
+
+(int, int) parse_withdraw_fail_message(slice cs) {
+	int asset_id = cs~load_asset_id();
+	int principal_amount = cs~load_principal();
+	return (asset_id, principal_amount);
+}
+
+;; --------------- op::withdraw_***_excess ---------------
+;; Withdraw excess message - refund extra TON attachment back to owner
+cell pack_withdraw_excess_message(int op, int query_id) {
+	return begin_cell()
+		.store_op_code(op)
+		.store_query_id(query_id)
+		.end_cell();
+}
+
+cell pack_withdraw_excess_message_with_data(int op, int query_id, cell custom_response_payload) {
+	return begin_cell()
+		.store_op_code(op)
+		.store_query_id(query_id)
+		.store_ref(custom_response_payload)
+		.end_cell();
+}
+
+cell pack_withdraw_success_excess_message(int op, int query_id) {
+	return begin_cell()
+		.store_op_code(0)
+		.store_slice("EVAA withdraw.")
+		.end_cell();
+}

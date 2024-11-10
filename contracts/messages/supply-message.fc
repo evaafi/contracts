@@ -1,0 +1,132 @@
+#include "../external/ton.fc";
+#include "../data/basic-types.fc";
+#include "../constants/op-codes.fc";
+
+;; --------------- op::supply_user ---------------
+;; Supply request message
+cell pack_supply_user_message(
+	int query_id,
+	int asset_id, int supply_amount_current,
+	int s_rate, int b_rate,
+	int dust, int max_token_amount,
+	int total_supply, int total_borrow,
+	int tracking_supply_index, int tracking_borrow_index,
+	int forward_ton_amount, cell custom_response_payload
+) {
+	return begin_cell()
+		.store_op_code(op::supply_user) ;; 32
+		.store_query_id(query_id) ;; 64
+		.store_asset_id(asset_id) ;; 256
+		.store_amount(supply_amount_current) ;; 64
+		.store_sb_rate(s_rate) ;; 64
+		.store_sb_rate(b_rate) ;; 64
+		.store_uint(dust, 64)
+		.store_uint(max_token_amount, 64)
+		.store_principal(total_supply) ;; 64
+		.store_principal(total_borrow) ;; 64
+		.store_tracking_index(tracking_supply_index)
+		.store_tracking_index(tracking_borrow_index)
+		.store_amount(forward_ton_amount) ;; 64
+		.store_ref(custom_response_payload)
+		.end_cell();
+}
+
+(int, int, int, int, int, int, int, int, int, int, int, cell) parse_supply_user_message(slice cs) {
+	return (
+		cs~load_asset_id(),
+		cs~load_amount(),
+		cs~load_sb_rate(),
+		cs~load_sb_rate(),
+		cs~load_uint(64),
+		cs~load_uint(64),
+		cs~load_principal(),
+		cs~load_principal(),
+		cs~load_tracking_index(),
+		cs~load_tracking_index(),
+		cs~load_amount(),
+		cs~load_ref()
+	);
+}
+
+;; --------------- op::supply_success ---------------
+;; Supply success (response) message
+cell pack_supply_success_message(
+	int query_id, slice owner_address,
+	int asset_id, int amount_supplied, int user_new_principal,
+	int repay_amount_principal, int supply_amount_principal, cell custom_response_payload
+) {
+	return begin_cell()
+		.store_op_code(op::supply_success);; 32
+		.store_query_id(query_id) ;; 64
+		.store_slice(owner_address) ;; 256
+		.store_asset_id(asset_id) ;; 256
+		.store_amount(amount_supplied);; 64
+		.store_principal(user_new_principal);; 64
+		.store_principal(repay_amount_principal);; 64
+		.store_principal(supply_amount_principal)	;; 64
+		.store_ref(custom_response_payload)
+		.end_cell();
+}
+
+(slice, int, int, int, int, int, cell) parse_supply_success_message(slice cs) {
+	return (
+		cs~load_msg_addr(), ;; owner_address
+		cs~load_asset_id(),
+		cs~load_amount(),
+		cs~load_principal(),
+		cs~load_principal(),
+		cs~load_principal(),
+		cs~load_ref()
+	);
+}
+
+;; --------------- op::supply_fail ---------------
+cell pack_supply_fail_message(
+	int query_id, slice owner_address,
+	int asset_id, int amount, int forward_ton_amount, cell custom_response_payload
+) {
+	return begin_cell()
+		.store_op_code(op::supply_fail)
+		.store_query_id(query_id)
+		.store_slice(owner_address)
+		.store_asset_id(asset_id)
+		.store_amount(amount)
+		.store_amount(forward_ton_amount)
+		.store_ref(custom_response_payload)
+		.end_cell();
+}
+
+(slice, int, int, int, cell) parse_supply_fail_message(slice cs) {
+	return (
+		cs~load_msg_addr(),
+		cs~load_asset_id(),
+		cs~load_amount(),
+		cs~load_amount(),
+		cs~load_ref()
+	);
+}
+
+;; --------------- op::supply_excess ---------------
+;; Supply excess message - refund extra TON attachment back to owner
+cell pack_supply_excess_message_with_data(int query_id, cell custom_response_payload) {
+	return begin_cell()
+		.store_op_code(op::supply_excess)
+		.store_query_id(query_id)
+		.store_ref(custom_response_payload)
+		.end_cell();
+}
+
+cell pack_supply_fail_message_with_data(int query_id, cell custom_response_payload) {
+	return begin_cell()
+		.store_op_code(op::supply_fail_excess)
+		.store_query_id(query_id)
+		.store_ref(custom_response_payload)
+		.end_cell();
+}
+
+cell pack_supply_success_excess_message() {
+	return begin_cell()
+		.store_op_code(0)
+		.store_slice("EVAA supply.")
+		.end_cell();
+}
