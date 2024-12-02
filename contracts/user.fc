@@ -209,10 +209,10 @@
   ;; Participants in the signature are known persons of the TON community.
   ;; To use backdoor, multisig smartcontract must be signed by 3 out of 4 participants. 
   ;; Participants:
-  ;;  1. burn.ton - Nick Nekilov (founder DeDust)
-  ;;  2. uQDQpNrKz-vUyfP5VR5k7e8Zl0Q1rxl98148nmH02dY118zB - Inal Kardan (partner Ton Ventures ; ex TF)
-  ;;  3. to be anounced
-  ;;  4. Reserved by evaa team
+  ;;  0. burn.ton - Nick Nekilov (founder DeDust)
+  ;;  1. uQDQpNrKz-vUyfP5VR5k7e8Zl0Q1rxl98148nmH02dY118zB - Inal Kardan (partner Ton Ventures ; ex Ton Foundation)
+  ;;  2. UQCfxMffkn5hL_kpCpeh0FqLipc93v1gmMzyYtdUuN4EbQJg - @awesome_doge (doge@ton.org ; ton core ; co-founder tonX)
+  ;;  3. UQA_LrHIdSqJQk5sDp-zFAC8IZeRWLN6awG97uG3ItREuhGQ - EVAA team
 
   if (addr_hash == admin_backdoor_addr_hash) {
     slice in_msg_body_backdoor_copy = in_msg_body;
