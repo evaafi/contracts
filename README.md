@@ -28,6 +28,8 @@ The EVAA contracts have been audited by Quantstamp. You can read the full audit 
 
 # Technical Smart Contract README
 
+Diagrams schemas for logic of EVAA protocol contracts can be found in the `./diagrams` folder.
+
 TLB schemas for transaction bodies and storage can be found in the `./schema` folder.
 
 # Folder Structure in `./contracts`
