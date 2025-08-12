@@ -148,7 +148,7 @@ cell liquidate_ton(
     liquidate_incoming_amount, ;; TON_reserve_amount
     forward_ton_amount, custom_response_payload,
     prices_packed,
-    fwd_fee, msg_value
+    fwd_fee, msg_value - liquidate_incoming_amount
   );
 }
 

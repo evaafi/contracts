@@ -103,14 +103,12 @@ int upgrade_config:user_code_version(cell config) inline {
         slice value = storage.upgrade_storage:get!("admin"H);
         new_storage_ref = new_storage_ref.store_slice(value);
 
-        slice value = storage.upgrade_storage:get!("admin_pk"H);
+        slice value = storage.upgrade_storage:get!("oracles_info"H);
         new_storage_ref = new_storage_ref.store_slice(value);
         
         slice value = storage.upgrade_storage:get!("tokens_keys"H);
         new_storage_ref = new_storage_ref.store_dict(value~load_dict());
 
-        slice value = storage.upgrade_storage:get!("wallet_to_master"H);
-        new_storage_ref = new_storage_ref.store_dict(value~load_dict());
     }
     new_storage = new_storage.store_ref(new_storage_ref.end_cell());
 

@@ -213,7 +213,7 @@ const int jetton_op::excesses = 0xd53276db;
   send_raw_message(msg, 0);
 }
 
-() emit_log_crash(int error_code, int op, int query_id) {
+() emit_log_crash(int error_code, int op, int query_id) impure {
   emit_log_simple(
 	  begin_cell()
 	  .store_uint(log::execution_crashed, 8)

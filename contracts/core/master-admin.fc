@@ -1,6 +1,5 @@
 ;; This file is licensed under the Business Source License (BUSL).
 ;; See the LICENSE.md file in the project root for more information.
-
 #include "../constants/constants.fc";
 #include "../external/stdlib.fc";
 #include "../constants/errors.fc";
@@ -336,14 +335,12 @@
   cell asset_config_collection = unpacked_marked_config~load_dict();
   int if_active = unpacked_marked_config~load_int(8);
   slice admin = unpacked_marked_config~load_msg_addr();
-  ;; Note Replace after upgrade with load of oracle_info
-  int admin_pk = unpacked_marked_config~load_uint(256); ;; prev version
+  slice oracles_info = unpacked_marked_config~load_bits_refs(33, 1);
+  
   cell tokens_keys = unpacked_marked_config~load_dict();
-  cell wallet_to_master = unpacked_marked_config~load_dict(); ;; rm on next update
+  
   cell asset_dynamics_collection = ds~load_dict();
 
-  ;; Note rm after upgrade
-  slice oracles_info = in_msg_body~load_bits_refs(33, 1);
 
   cell new_asssets_config = new_dict();
   (int asset_id, slice asset_config, int flag) = asset_config_collection.udict_get_min?(256);
@@ -370,9 +367,9 @@
 	  int liquidation_reserve_factor = asset_config_params~load_uint(16);
     
     ;; Note Replace after upgrade with proper loads!
-	  int min_principal_for_rewards = 0; 
-	  int base_tracking_supply_speed = 0; 
-	  int base_tracking_borrow_speed = 0; 
+	  int min_principal_for_rewards = asset_config_params~load_uint(64); 
+	  int base_tracking_supply_speed = asset_config_params~load_uint(64); 
+	  int base_tracking_borrow_speed = asset_config_params~load_uint(64); 
 
     cell packed_config = pack_asset_config(
 		  jw_address_hash, decimals,
@@ -407,10 +404,10 @@
             int last_accrual = asset_dynamics~load_timestamp();
             int token_balance = asset_dynamics~load_balance();
 
-            int tracking_supply_index = 0;
-            int tracking_borrow_index = 0;
-            int awaited_supply = 0;
-
+	          int tracking_supply_index = asset_dynamics~load_tracking_index();
+	          int tracking_borrow_index = asset_dynamics~load_tracking_index();
+	          int awaited_supply = asset_dynamics~load_balance();
+            
             cell asset_dynamics_new = pack_asset_dynamics(
                 asset_s_rate, asset_b_rate,
                 total_supply_principal, total_borrow_principal,
