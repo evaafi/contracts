@@ -1,3 +1,6 @@
+;; This file is licensed under the Business Source License (BUSL).
+;; See the LICENSE.md file in the project root for more information.
+
 #pragma version >=0.2.0;
 
 #include "external/stdlib.fc";
@@ -39,26 +42,6 @@
 #include "core/user-supply.fc";
 #include "core/user-liquidate.fc";
 #include "core/user-supply-withdrawal.fc";
-
-;; ------------------------------------------------ *Testing function only. Do not use in production code!*
-() set_last_mc_block_seqno(int new_last_mc_block_seqno) impure {
-  tuple c7 = _get_c7();
-  tuple last_mc_block = empty_tuple();
-  last_mc_block~tpush(0);
-  last_mc_block~tpush(0);
-  last_mc_block~tpush(new_last_mc_block_seqno);
-  tuple new_blocks = empty_tuple();
-  tuple new_blocks_wrapper = empty_tuple();
-  new_blocks~tpush(last_mc_block);
-  new_blocks_wrapper~tpush(new_blocks);
-  _set_c7(
-    c7.tset(0,
-      c7.tuple_at(0)
-                .tset(13, new_blocks_wrapper)
-    )
-  );
-}
-;; ------------------------------------------------ *Testing function only. Do not use in production code!*
 
 () handle_transaction(
   slice sender_address, slice in_msg_body_original,
@@ -193,10 +176,6 @@
   slice cs = in_msg_full.begin_parse();
   int flags = cs~load_uint(4);
   
-  ;; ------------------------------------------------ *Testing function only. Do not use in production code!*
-  set_last_mc_block_seqno(now()); ;; <-----------------------------------------------------------------------
-  ;; ------------------------------------------------ *Testing function only. Do not use in production code!*
-
   if (flags & 1) {
     ;; Bounced message received
     ;; That was not supposed to happen

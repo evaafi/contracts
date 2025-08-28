@@ -1,2 +1,5 @@
+;; This file is licensed under the Business Source License (BUSL).
+;; See the LICENSE.md file in the project root for more information.
+
 const int op::pyth_response_error = 0x10002;
 const int op::pyth_parse_price_feed_updates = 5;

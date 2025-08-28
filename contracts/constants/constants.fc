@@ -1,3 +1,6 @@
+;; This file is licensed under the Business Source License (BUSL).
+;; See the LICENSE.md file in the project root for more information.
+
 const int constants::factor_scale = 1000000000000; ;; = 10^12
 
 const int constants::asset_coefficient_scale = 10000;

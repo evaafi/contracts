@@ -1,3 +1,6 @@
+;; This file is licensed under the Business Source License (BUSL).
+;; See the LICENSE.md file in the project root for more information.
+
 const int error::unsupported_price_id = 4000;
 const int error::not_saved_price_id = 4001;
 const int error::referred_price_id_not_found = 4003;

@@ -14,7 +14,7 @@ The EVAA v8 contracts have been audited by Trail of Bits. You can read the full 
 
 *To verify that the code in the `./contracts` folder is the same as the audited version, compare the hashes of each file in this folder with the hashes listed in the Trail of Bits certificate.*
 
-*If you'd like to compare the hash of a specific file with the one in the audit report, check out current code in this repo. Then, generate the hash for the file and compare it with the one in the audit certificate.*
+*If you'd like to compare the hash of a specific file with the one in the audit report, check out commit `393b4c386c80a7333eb26def323afc5e3c43b9d5` in this repo. Then, generate the hash for the file and compare it with the one in the audit certificate.*
 
 # Audit of v6 by Quantstamp
 

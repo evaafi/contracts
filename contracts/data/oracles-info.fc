@@ -1,3 +1,6 @@
+;; This file is licensed under the Business Source License (BUSL).
+;; See the LICENSE.md file in the project root for more information.
+
 #include "../external/stdlib.fc";
 
 (slice, cell, int, int, int, int) parse_oracles_info(slice oracles_info) impure {

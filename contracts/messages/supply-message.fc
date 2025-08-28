@@ -1,3 +1,6 @@
+;; This file is licensed under the Business Source License (BUSL).
+;; See the LICENSE.md file in the project root for more information.
+
 #include "../external/ton.fc";
 #include "../data/basic-types.fc";
 #include "../constants/op-codes.fc";

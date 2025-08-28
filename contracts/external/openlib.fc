@@ -1,3 +1,6 @@
+;; This file is licensed under the Business Source License (BUSL).
+;; See the LICENSE.md file in the project root for more information.
+
 ;; cherry-picked from https://github.com/continuation-team/openlib.func/blob/main/openlib.func
 
 int     ext::addr_std?(slice addr) asm "b{10000000000} PUSHSLICE SDPPFXREV";

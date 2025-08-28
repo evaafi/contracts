@@ -1,2 +1,5 @@
+;; This file is licensed under the Business Source License (BUSL).
+;; See the LICENSE.md file in the project root for more information.
+
 ;; evaa related
 const int evaa::price_scale = 1000000000;
