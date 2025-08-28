@@ -1,47 +1,60 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "../external/stdlib.fc";
 #include "../constants/op-codes.fc";
 #include "../data/basic-types.fc";
 #include "../data/prices-packed.fc";
 #include "tx-utils.fc";
 
+#include "../plugins/pyth/errors.fc";
+#include "../plugins/pyth/op_codes.fc";
+#include "../plugins/pyth/pyth_request.fc";
+#include "../plugins/pyth/parse_price_feeds.fc";
+
 (int) if_active_process (
   int my_balance, int msg_value, cell in_msg_full, slice in_msg_body,
   slice sender_address, int addr_hash, int fwd_fee,
-  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor
 ) impure inline {
   if (~ slice_data_equal?(sender_address, admin)) { ;; if not Admin
-    slice in_msg_body_copy = in_msg_body; 
-    int op = in_msg_body_copy~load_op_code();
-    int query_id = in_msg_body_copy~load_query_id();
+    int op = in_msg_body~load_op_code();
 
     if ((op == op::supply_master)
-      | (op == op::withdraw_master)
       | (op == op::liquidate_master)
+      | (op == op::supply_withdraw_master_without_prices)
       | (op == op::idle_master))
       ;; ^ one of the "front-facing" op-codes, which initiate new operations
     {
+      int query_id = in_msg_body~load_query_id();
+
       ;; Stop processing and return TONs back to owner
-      throw(error::disabled);
+      send_message(
+        sender_address,
+        0,
+        begin_cell().store_op_code(error::disabled).store_query_id(query_id).store_ref(in_msg_full).end_cell(), 
+        sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
+      );
+      return ret::stop_execution;
     } elseif (op == jetton_op::transfer_notification) {
       ;; If it is jetton supply / jetton liquidate
       (_, int f) = tokens_keys.udict_get?(256, addr_hash);
       throw_unless(error::received_unsupported_jetton, f); ;; check jetton is supported
       ;; NOTE: !! It might be possible to refund unsupported jettons / do we need to refund them?
-
-      int jetton_amount = in_msg_body_copy~load_coins(); 
-      slice from_address = in_msg_body_copy~load_msg_addr();
-      if (~ slice_data_equal?(from_address, admin)) { ;; if not Admin
+      int query_id = in_msg_body~load_query_id();
+      int jetton_amount = in_msg_body~load_coins(); 
+      slice initial_sender = in_msg_body~load_msg_addr();
+      if (~ slice_data_equal?(initial_sender, admin)) { ;; if not Admin
         ;; return jettons back to Owner
         ;; NOTE: !!! will be nice to check that sender has enough TON attachment for gas
         ;; (here and in other such places)
+        msg_value -= (get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
+        int forward_ton_amount = msg_value - fee::jetton_transfer;
+        
         respond_send_jetton(
-          sender_address, from_address,
+          sender_address, initial_sender,
           query_id, jetton_amount,
-          begin_cell().store_op_code(error::disabled).store_ref(begin_cell().store_slice(in_msg_body).end_cell()).end_cell(), 0 ;; lets send entire body on disabled so third party can process it ;; todo would be nice to have not a 0 here but some amount setted by sender
-          ;; NOTE: !! Do we need to also store some other info?
+          begin_cell().store_op_code(error::disabled).store_query_id(query_id).store_ref(in_msg_full).end_cell(), 
+          forward_ton_amount
         ); 
         return ret::stop_execution;
       }
@@ -49,8 +62,25 @@
       ;; although it's not exactly clear:
       ;; why would Admin want to Supply/Liquidate something while the Protocol is stopped, but let's keep this option open.
       ;; Maybe some intricate Liquidate cases might arrise that need this kind of fixing?
-    }
-    ;; else: it is one of the "internal" op codes (from User smart contracts to Master)
+    } elseif (op == op::pyth_parse_price_feed_updates) {
+      var (pyth_address, feeds_data, prices_ttl, _, _, _) = parse_oracles_info(oracles_info.begin_parse());
+      ;; prevent malicious call
+      throw_unless(error::pyth_not_authorized, equal_msg_addr?(sender_address, pyth_address));
+      (_, cell packed_prices, slice pyth_sender, cell operation_payload) = parse_price_feed_updates_response(in_msg_body);
+      (int op_code, int query_id, slice operation_body) = parse_operation_payload(operation_payload);
+
+      if (~ equal_msg_addr?(pyth_sender, my_address())) { ;; if coming from pyth and evaa master sc not a pyth_sender then its new TX and we can reject it
+        send_message(
+          pyth_sender,
+          0,
+          begin_cell().store_op_code(error::disabled).store_query_id(query_id).store_ref(in_msg_full).end_cell(), 
+          sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
+        );
+        return ret::stop_execution;
+      }
+    } 
+
+    ;; else: it is one of the "internal" op codes (from User smart contracts to Master) or !! from pyth for liquidation that already started (or SW that already started)
     ;; We don't allow owners to initiate new operations,
     ;; but we allow all ongoing operations to finish processing.
     ;; The validity of such [internal] requests

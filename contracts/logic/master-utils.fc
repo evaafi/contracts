@@ -1,6 +1,3 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "../external/stdlib.fc";
 #include "../data/asset-dynamics-packer.fc";
 #include "../storage/user-storage.fc";
@@ -14,7 +11,8 @@
 ) {
   var (asset_s_rate, asset_b_rate, total_supply_principal, total_borrow_principal, last_accrual, asset_balance, _, _, _) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
 
-  (int jw_address_hash, int decimals, int collateral_factor, int liquidation_threshold, _, int base_borrow_rate, int borrow_rate_slope_low, int borrow_rate_slope_high, int supply_rate_slope_low, int supply_rate_slope_high, int target_utilization, int origination_fee, int dust, _, int reserve_factor, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(asset_id);
+  (int jw_address_hash, int decimals, _, _, _, int base_borrow_rate, int borrow_rate_slope_low, int borrow_rate_slope_high, int supply_rate_slope_low, int supply_rate_slope_high, int target_utilization, int origination_fee, int dust, _, int reserve_factor, _, _, _, _,
+  _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(asset_id);
 
   int total_supply = present_value_supply_calc(asset_s_rate, total_supply_principal);
   int total_borrow = present_value_borrow_calc(asset_b_rate, total_borrow_principal);
@@ -93,7 +91,8 @@
         (slice asset_slice, _) = assets_config_collection.udict_get?(256, asset_id);
 
         (_, int decimals, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
-            int min_principal_for_rewards, int base_tracking_supply_speed, int base_tracking_borrow_speed
+            int min_principal_for_rewards, int base_tracking_supply_speed, int base_tracking_borrow_speed,
+            _, _, _, _
         ) = asset_slice.unpack_asset_config();
 
         ;; Note Replace after upgrade with proper loads!
@@ -150,8 +149,8 @@ cell asset_dynamics_collection, cell asset_config_collection,
         );
         ;; Update tracking indexes
         (_, int decimals, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
-            int min_principal_for_rewards, int base_tracking_supply_speed, int base_tracking_borrow_speed
-        ) = asset_config_collection.asset_config_collection:get_unpacked(asset_id);
+            int min_principal_for_rewards, int base_tracking_supply_speed, int base_tracking_borrow_speed,
+            _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(asset_id);
 
         (tracking_supply_index, tracking_borrow_index) = accrue_tracking_indexes(
             tracking_supply_index, tracking_borrow_index, last_accrual,
@@ -208,9 +207,6 @@ int get_asset_reserves_direct(
   );
 }
 
-;; Function to calculate how much of specific asset
-;; protocol has available for withdrawing or liquidation
-;;NOTE if we want to set liquidity as supply - borrow then use this function everywhere where i leftet NOTEs  
 int get_asset_liquidity(
   int total_supply_principal,
   int total_borrow_principal,
@@ -220,11 +216,6 @@ int get_asset_liquidity(
   int total_borrow = present_value_borrow_calc(b_rate, total_borrow_principal);
   return total_supply - total_borrow;
 }
-;; This ^ formula might look strange, but we get it by subtracting:
-;; asset_balance - developers_money
-;; (substituting developers_money)
-;; = asset_balance - (asset_balance - total_supply + total_borrow)
-;; = total_supply - total_borrow
 
 int get_asset_liquidity_minus_reserves(
   int total_supply_principal,

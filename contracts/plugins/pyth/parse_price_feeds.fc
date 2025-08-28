@@ -1,0 +1,99 @@
+#include "constants.fc";
+#include "errors.fc";
+#include "stdlib.fc";
+
+(int, int, int) unpack_price_map_item(cell pyth_to_evaa_ids, int pyth_feed_id) impure {
+    (slice evaa_feed_slice, int found?) = pyth_to_evaa_ids.udict_get?(256, pyth_feed_id);
+    if (~ found?) {
+        return (error::unsupported_price_id, 0, 0);
+    }
+
+    int pyth_multiplier_feed_id = 0;
+    int evaa_feed_id = evaa_feed_slice~load_uint(256);
+    if (evaa_feed_slice.slice_bits() > 0) {
+        pyth_multiplier_feed_id = evaa_feed_slice~load_uint(256);
+    }
+    evaa_feed_slice.end_parse();
+
+    return (0, evaa_feed_id, pyth_multiplier_feed_id);
+}
+
+(cell, tuple) parse_pyth_price_data(cell price_feeds_cell) impure {
+    cell pyth_feeds_dict = new_dict();
+    tuple pyth_ids_tuple = empty_tuple();
+
+    while (~ null?(price_feeds_cell)) {
+        slice price_feeds_slice = price_feeds_cell.begin_parse();
+        int pyth_price_feed_id = price_feeds_slice~load_uint(256);
+        cell price_data = price_feeds_slice~load_ref();
+        slice price_data_slice = price_data.begin_parse();
+        cell current_price_cell = price_data_slice~load_ref();
+
+        pyth_feeds_dict~udict_set(256, pyth_price_feed_id, current_price_cell.begin_parse());
+        pyth_ids_tuple~tpush(pyth_price_feed_id);
+
+        if (price_feeds_slice.slice_refs_empty?()) {
+            price_feeds_cell = null();
+        } else {
+            price_feeds_cell = price_feeds_slice~load_ref();
+        }
+    }
+
+    return (pyth_feeds_dict, pyth_ids_tuple);
+}
+
+(int, int, int, int, int) unpack_pyth_data_item(cell pyth_feeds_dict, int pyth_feed) impure {
+    (slice current_price_slice, int found?) = pyth_feeds_dict.udict_get?(256, pyth_feed);
+    if (~ found?) {
+        return (0, 0, 0, 0, 0);
+    }
+
+    int price = current_price_slice~load_int(64);
+    int conf = current_price_slice~load_uint(64);
+    int expo = current_price_slice~load_int(32);
+    int timestamp = current_price_slice~load_uint(64);
+    int scale = fast_dec_pow(0 - expo);
+    current_price_slice.end_parse();
+
+    return (found?, price, conf, scale, timestamp);
+}
+
+int calculate_referred_price(int price_original, int scale_original, int price_referred, int scale_referred) impure inline {
+    return price_referred * evaa::price_scale / scale_referred * price_original / scale_original;
+}
+
+(int, int, int, int) calculate_evaa_price(cell pyth_feeds_dict, int pyth_original_id, cell pyth_to_evaa_ids) impure {
+    (int found_original?, int price_original, _, int scale_original, int timestamp_original) = pyth_feeds_dict.unpack_pyth_data_item(pyth_original_id);
+
+    if (~ found_original?) {
+        return (error::not_saved_price_id, 0, 0, 0);
+    }
+
+    (int error, int evaa_feed_id, int pyth_multiplier_id) = pyth_to_evaa_ids.unpack_price_map_item(pyth_original_id);
+    if (error) {
+        return (error, 0, 0, 0);
+    }
+    if (~ pyth_multiplier_id) {
+        int evaa_price = muldiv(price_original, evaa::price_scale, scale_original);
+        return (0, evaa_feed_id, evaa_price, timestamp_original);
+    }
+
+    (int found_referred?, int price_referred, _, int scale_referred, int timestamp_referred) = pyth_feeds_dict.unpack_pyth_data_item(pyth_multiplier_id);
+    if (~ found_referred?) {
+        return (error::referred_price_id_not_found, 0, 0, 0);
+    }
+
+    int timestamp = min(timestamp_original, timestamp_referred);
+    int evaa_price = calculate_referred_price(price_original, scale_original, price_referred, scale_referred);
+
+    return (0, evaa_feed_id, evaa_price, timestamp);
+}
+
+(int, cell, slice, cell) parse_price_feed_updates_response(slice response) impure {
+    int num_price_feeds = response~load_uint(8); ;; can be ignored
+    cell price_feeds_cell = response~load_ref();
+    slice initial_sender = response~load_msg_addr();
+    cell custom_payload = response~load_ref();
+    response.end_parse();
+    return (num_price_feeds, price_feeds_cell, initial_sender, custom_payload);
+}

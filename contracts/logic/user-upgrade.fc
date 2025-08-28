@@ -1,6 +1,3 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "../external/stdlib.fc";
 #include "../constants/errors.fc";
 #include "../constants/op-codes.fc";
@@ -42,14 +39,9 @@
     int code_version, slice master_address, slice owner_address, cell user_principals, int state, cell user_rewards, cell backup_cell_1, cell backup_cell_2
   ) = user::storage::load();
 
-  ;; We need to check if the user is in free state before upgrading
   if (state == user_state::free) {
     try {
       throw_if(error::broken_upgrade_info, upgrade_info_cell.null?());
-
-      ;; we need to pack it before set_c3
-      ;; so, universal_data is coming from old version of contract code (from current version for N+1 next versoin of the code)
-      cell universal_data = user::upgrade::pack_universal_storage_after_v6(master_address, owner_address, user_principals, state, user_rewards, backup_cell_1, backup_cell_2);
 
       slice data_without_version = get_data().begin_parse();
       data_without_version~skip_coins();
@@ -67,42 +59,14 @@
 
       int allow_data_change = false;
 
-      ;; Code version can be either actual code version or 0 if the contract was just deployed
-      ;; Function calls are made after set_c3 and therefore pack - unpack cycle is useless here
-
-      {-
-        builder builded_store = begin_cell();
-
-        if (code_version == 0) {
-          ;; unpack_universal_storage suppose to support upacking universal_data that was packed in previous versions
-          builded_store = user::upgrade::unpack_universal_storage(
-            self_code_version, universal_data,
-            new_data
-          );
-          allow_data_change = true; ;; upgrade from v0 requires data structure change
-        }
-        elseif (code_version == 1) {
-          ;; unpack_universal_storage suppose to support upacking universal_data that was packed in previous versions
-          builded_store = user::upgrade::unpack_universal_storage_version_after_update(
-            self_code_version, universal_data,
-            new_data
-          );
-          allow_data_change = true; ;; upgrade from v1 requires data structure change
-        } 
-        else {
-          builded_store = begin_cell().store_slice(data_without_version);
-        }
-      -}
-
       if (code_version == 0) {
-        ;; allow on_upgrade to process init data to actual format
         allow_data_change = true;
       }
 
       set_data(
         begin_cell()
         .store_coins(expected_code_version)
-        .store_slice(data_without_version) ;; .store_builder(builded_store)
+        .store_slice(data_without_version) 
         .end_cell()
       );
 

@@ -1,6 +1,3 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "../external/stdlib.fc";
 #include "../logic/tx-utils.fc";
 #include "../constants/op-codes.fc";
@@ -8,7 +5,7 @@
 () get_store_process  (
   int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
   slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
-  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor, ;; storage params
   int op, int query_id ;; trx body
 ) impure inline {
     cell ds = get_data();

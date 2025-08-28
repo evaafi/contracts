@@ -1,0 +1,946 @@
+#include "../constants/constants.fc";
+#include "../external/stdlib.fc";
+#include "../constants/errors.fc";
+#include "../constants/fees.fc";
+#include "../constants/logs.fc";
+#include "../data/asset-dynamics-packer.fc";
+#include "../data/basic-types.fc";
+#include "../messages/supply-withdraw-message.fc";
+#include "../logic/addr-calc.fc";
+#include "../logic/master-get-methods.fc";
+#include "../logic/tx-utils.fc";
+#include "../logic/utils.fc";
+
+cell master_core_logic_supply_withdraw(
+    int query_id, int user_version, cell user_code,
+    cell asset_config_collection, cell asset_dynamics_collection,
+    slice initial_sender,
+    int supply_amount, int supply_asset_id,
+    int withdraw_amount, int withdraw_asset_id, slice recipient_address_of_withdraw, cell prices_packed, 
+    int message_send_mode, int msg_value, int fwd_fee, int ton_amount_for_repay_remainings, cell custom_response_payload, int subaccount_id, int return_repay_remainings_flag, int custom_payload_saturation_flag
+) impure {
+
+    supply_amount != 0 ? asset_dynamics_collection~update_old_rates_and_provided_asset_id(asset_config_collection, supply_asset_id, 0) : ();
+
+    asset_dynamics_collection~update_old_rates_and_provided_asset_id(asset_config_collection,  withdraw_asset_id, 0);
+    
+    if (ton_amount_for_repay_remainings < fee::repay_remainings_tx) {
+        ton_amount_for_repay_remainings = fee::repay_remainings_tx;
+    }
+
+    cell supply_withdraw_user_message = pack_supply_withdraw_user_message(
+        query_id,
+        supply_amount, supply_asset_id,
+        withdraw_amount, withdraw_asset_id, recipient_address_of_withdraw, prices_packed,
+        asset_config_collection, asset_dynamics_collection, ton_amount_for_repay_remainings, custom_response_payload, subaccount_id, return_repay_remainings_flag, custom_payload_saturation_flag
+    );
+
+    int enough_fee = supply_withdraw_min_attachment(fwd_fee, supply_withdraw_user_message) + ton_amount_for_repay_remainings;
+
+    if (msg_value < enough_fee) {
+        cell body = begin_cell().store_op_code(error::supply_withdraw_master_transaction_fees).store_query_id(query_id).store_ref(custom_response_payload).end_cell();
+        if (supply_asset_id == constants::ton_asset_id) {
+            send_message(
+                initial_sender,
+                0,
+                body,
+                message_send_mode ;; if ton => we send 128 + raw reserve
+            );
+        } else {
+            (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(supply_asset_id);
+
+            msg_value -= (modest_fwd_fee_estimation(fwd_fee)
+                + fee::supply_withdraw_master
+                + get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
+
+            int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+            immediate_asset_refund(
+                initial_sender,
+                query_id,
+                jw_address_hash, supply_amount,
+                body, forward_ton_amount
+            );
+        }
+        return asset_dynamics_collection;
+    }
+
+    if (supply_asset_id == constants::ton_asset_id) {
+        raw_reserve(supply_amount, reserve::REGULAR); ;; additionaly, reserve supplied amount
+    }
+
+    send_message_to_evaa_user_sc(
+        BLANK_CODE(), user_version, user_code, initial_sender,
+        supply_withdraw_user_message, message_send_mode, subaccount_id
+    );
+
+    return asset_dynamics_collection;
+}
+
+cell supply_withdraw_ton(
+    int query_id,
+    int user_version, cell user_code,
+    cell asset_config_collection, cell asset_dynamics_collection,
+    slice initial_sender,
+    int supply_amount, int supply_asset_id,
+    int withdraw_amount, int withdraw_asset_id, slice recipient_address_of_withdraw, cell prices_packed, 
+    int msg_value, int fwd_fee, int ton_amount_for_repay_remainings, cell custom_response_payload, int subaccount_id, int return_repay_remainings_flag, int custom_payload_saturation_flag
+) impure inline {
+    raw_reserve(0, reserve::INCREASE_BY_ORIGINAL_BALANCE);
+    return master_core_logic_supply_withdraw(
+        query_id,
+        user_version, user_code,
+        asset_config_collection, asset_dynamics_collection,
+        initial_sender,
+        supply_amount, supply_asset_id,
+        withdraw_amount, withdraw_asset_id, recipient_address_of_withdraw, prices_packed, 
+        sendmode::CARRY_ALL_BALANCE, msg_value - supply_amount, fwd_fee, ton_amount_for_repay_remainings, custom_response_payload, subaccount_id, return_repay_remainings_flag, custom_payload_saturation_flag
+    );
+}
+
+() supply_withdraw_master_ton_pyth_process(
+    int my_balance, int msg_value, slice in_msg_body, ;; recv_internal params
+    slice initial_sender, int fwd_fee, ;; in_msg_full params
+    cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys, cell asset_dynamics_collection, slice supervisor, ;; storage params
+    int op, int query_id, cell prices_packed, ;; trx body
+    cell feeds_data, int prices_ttl
+) impure inline {
+    (
+        int supply_amount, int withdraw_amount, int withdraw_asset_id, slice recipient_address_of_withdraw, int include_user_code, cell requested_ref_tokens,
+        int ton_amount_for_repay_remainings, cell custom_response_payload, int subaccount_id, int return_repay_remainings_flag, int custom_payload_saturation_flag
+    ) = parse_supply_withdraw_master_message(in_msg_body, false);
+
+    int supply_asset_id = constants::ton_asset_id;
+
+    (_, int user_version, _, _, _, cell user_code, _, _) = upgrade_config.unpack_upgrade_config();
+
+    slice custom_response_payload_open = custom_response_payload.begin_parse();
+    cell custom_response_payload_extended = custom_response_payload;
+    ifnot (custom_response_payload_open.slice_empty?()) {
+        custom_response_payload_extended = begin_cell()
+				.store_slice(initial_sender)
+				.store_ref(custom_response_payload)
+			.end_cell(); 
+    }
+
+    (_, int is_ton_supported) = asset_config_collection.udict_get?(256, constants::ton_asset_id);
+    int ton_supply_not_supported = (~ is_ton_supported) & (supply_amount != 0);
+    int addresses_not_valid = ~ is_valid_address?(recipient_address_of_withdraw);
+    int custom_payload_not_valid = ~ is_valid_custom_response_payload?(custom_response_payload);
+    int prices_error = 0;
+    if (~ prices_packed.null?()) {
+        prices_error = prices_packed~packed_price:parse_check(feeds_data, requested_ref_tokens, prices_ttl);
+    }
+    (_, int is_withdraw_asset_exist) = asset_config_collection.udict_get?(256, withdraw_asset_id);
+
+    int data_not_valid = ((supply_asset_id == withdraw_asset_id) & (supply_amount != 0)) | (~ is_withdraw_asset_exist);
+
+    if (addresses_not_valid | custom_payload_not_valid | prices_error | data_not_valid | ton_supply_not_supported) {
+        int error_code = addresses_not_valid ? error::invalid_address_provided :
+                            custom_payload_not_valid ? error::custom_response_payload_too_big :
+                            prices_error ? prices_error :
+                            ton_supply_not_supported ? error::ton_unsupported :
+                            error::invalid_data;
+        send_message(
+            initial_sender,
+            0,
+            begin_cell().store_op_code(error_code).store_query_id(query_id).store_ref(custom_response_payload_extended).end_cell(),
+            sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
+        );
+        return ();
+    }
+
+    asset_dynamics_collection = supply_withdraw_ton(
+        query_id,
+        user_version, include_user_code ? user_code : null(),
+        asset_config_collection, asset_dynamics_collection,
+        initial_sender,
+        supply_amount, supply_asset_id,
+        withdraw_amount, withdraw_asset_id, recipient_address_of_withdraw, prices_packed,
+        msg_value, fwd_fee, ton_amount_for_repay_remainings, custom_response_payload_extended, subaccount_id, return_repay_remainings_flag, custom_payload_saturation_flag
+    );
+
+    master::storage::save(
+        meta, upgrade_config,
+        asset_config_collection, 
+        if_active, oracles_info, admin, tokens_keys, 
+        asset_dynamics_collection, supervisor
+    );
+
+    return ();
+}
+
+() supply_withdraw_handle_exception(
+    int my_balance, int msg_value, slice in_msg_body, slice sender_address, int fwd_fee,
+    cell upgrade_config, cell asset_config_collection, int query_id, int error_code
+) impure inline {
+    (_, _, _, _, _, _, _, cell custom_response_payload, _, _, _) = parse_supply_withdraw_master_message(in_msg_body, false);
+
+    slice custom_response_payload_open = custom_response_payload.begin_parse();
+    cell custom_response_payload_extended = custom_response_payload;
+    ifnot (custom_response_payload_open.slice_empty?()) {
+        custom_response_payload_extended = begin_cell()
+				.store_slice(sender_address)
+				.store_ref(custom_response_payload)
+			.end_cell(); 
+    }
+
+    send_message(
+        sender_address,
+        0,
+        begin_cell().store_op_code(error_code).store_query_id(query_id).store_ref(custom_response_payload_extended).end_cell(),
+        sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
+    );
+
+    return ();
+}
+
+cell supply_withdraw_jetton(
+    int query_id,
+    int user_version, cell user_code,
+    cell asset_config_collection, cell asset_dynamics_collection,
+    slice initial_sender,
+    int supply_amount, int supply_asset_id,
+    int withdraw_amount, int withdraw_asset_id, slice recipient_address_of_withdraw, cell prices_packed, 
+    int msg_value, int fwd_fee, int ton_amount_for_repay_remainings, cell custom_response_payload, int subaccount_id, int return_repay_remainings_flag, int custom_payload_saturation_flag
+) impure inline {
+    return master_core_logic_supply_withdraw(
+        query_id,
+        user_version, user_code,
+        asset_config_collection, asset_dynamics_collection,
+        initial_sender,
+        supply_amount, supply_asset_id,
+        withdraw_amount, withdraw_asset_id, recipient_address_of_withdraw, prices_packed, 
+        sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE, msg_value + 1, fwd_fee, ton_amount_for_repay_remainings, custom_response_payload, subaccount_id, return_repay_remainings_flag, custom_payload_saturation_flag
+    );
+}
+
+
+() supply_withdraw_master_jetton_pyth_process(
+    int my_balance, int msg_value, slice evaa_operation_slice, ;; recv_internal params
+    slice master_jw_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+    cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor, ;; storage params
+    int query_id, int jetton_amount, slice initial_sender,
+    cell prices_packed, ;; dict: evaa_id=>[price: uint64, timestamp: uint64]
+    cell feeds_data, int prices_ttl
+) impure inline {
+    (
+        _, int withdraw_amount, int withdraw_asset_id, slice recipient_address_of_withdraw, int include_user_code, cell requested_ref_tokens,
+        int ton_amount_for_repay_remainings, cell custom_response_payload, int subaccount_id, int return_repay_remainings_flag, int custom_payload_saturation_flag
+    ) = parse_supply_withdraw_master_message(evaa_operation_slice, true);
+
+    (slice supply_token_id, int found) = tokens_keys.udict_get?(256, addr_hash);
+    int supply_asset_id = supply_token_id~load_asset_id();
+    int supply_amount = jetton_amount;
+
+    (_, int user_version, _, _, _, cell user_code, _, _) = upgrade_config.unpack_upgrade_config();
+
+    slice custom_response_payload_open = custom_response_payload.begin_parse();
+    cell custom_response_payload_extended = custom_response_payload;
+    ifnot (custom_response_payload_open.slice_empty?()) {
+        custom_response_payload_extended = begin_cell()
+				.store_slice(initial_sender)
+				.store_ref(custom_response_payload)
+			.end_cell();
+    }
+
+    try {
+        int prices_error = prices_packed~packed_price:parse_check(feeds_data, requested_ref_tokens, prices_ttl);
+
+        if (prices_error) {
+            int error_code = prices_error;
+            (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(supply_asset_id);
+
+            msg_value -= (modest_fwd_fee_estimation(fwd_fee)
+                    + fee::supply_withdraw_master
+                    + get_compute_fee(constants::wc_master, gas_consumed())
+                    + fee::unfinished_runtime_gas
+                    + storage_fees());
+
+            int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+            immediate_asset_refund(
+                initial_sender,
+                query_id,
+                jw_address_hash, supply_amount,
+                begin_cell().store_op_code(error_code).store_query_id(query_id).store_ref(custom_response_payload_extended).end_cell(),
+                forward_ton_amount
+            );
+            return ();
+        }
+
+        asset_dynamics_collection = supply_withdraw_jetton(
+            query_id,
+            user_version, include_user_code ? user_code : null(),
+            asset_config_collection, asset_dynamics_collection,
+            initial_sender,
+            supply_amount, supply_asset_id,
+            withdraw_amount, withdraw_asset_id, recipient_address_of_withdraw, prices_packed,
+            msg_value, fwd_fee, ton_amount_for_repay_remainings, custom_response_payload_extended, subaccount_id, return_repay_remainings_flag, custom_payload_saturation_flag
+        );
+
+        master::storage::save(
+            meta, upgrade_config,
+            asset_config_collection, 
+            if_active, oracles_info, admin, tokens_keys, 
+            asset_dynamics_collection, supervisor
+        );
+    } catch (_, error_code) {
+            (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(supply_asset_id);
+
+            msg_value -= (modest_fwd_fee_estimation(fwd_fee)
+                    + fee::supply_withdraw_master
+                    + get_compute_fee(constants::wc_master, gas_consumed())
+                    + fee::unfinished_runtime_gas
+                    + storage_fees());
+
+            int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+            immediate_asset_refund(
+                initial_sender,
+                query_id,
+                jw_address_hash, supply_amount,
+                begin_cell().store_op_code(error_code).store_query_id(query_id).store_ref(custom_response_payload_extended).end_cell(),
+                forward_ton_amount
+            );
+    }
+    
+    return ();
+}
+
+() supply_withdraw_master_jetton_without_prices_process(
+    int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+    slice master_jw_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+    cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor, ;; storage params
+    int jetton_op_code, int query_id, int jetton_amount, slice initial_sender, int user_version, cell user_code ;; jetton tx body params
+) impure inline {
+    (
+        _, int withdraw_amount, int withdraw_asset_id, slice recipient_address_of_withdraw,
+        int include_user_code, _, int ton_amount_for_repay_remainings, cell custom_response_payload, int subaccount_id, int return_repay_remainings_flag, int custom_payload_saturation_flag
+    ) = parse_supply_withdraw_master_message(in_msg_body, true);
+
+    (slice supply_token_id, int found) = tokens_keys.udict_get?(256, addr_hash);
+    int supply_asset_id = supply_token_id~load_asset_id();
+    int supply_amount = jetton_amount;
+
+    (_, int user_version, _, _, _, cell user_code, _, _) = upgrade_config.unpack_upgrade_config();
+
+    slice custom_response_payload_open = custom_response_payload.begin_parse();
+    cell custom_response_payload_extended = custom_response_payload;
+    ifnot (custom_response_payload_open.slice_empty?()) {
+        custom_response_payload_extended = begin_cell()
+				.store_slice(initial_sender)
+				.store_ref(custom_response_payload)
+			.end_cell();
+    }
+    
+    int addresses_not_valid = ~ is_valid_address?(recipient_address_of_withdraw);
+    int custom_payload_not_valid = ~ is_valid_custom_response_payload?(custom_response_payload);
+    (_, int is_withdraw_asset_exist) = asset_config_collection.udict_get?(256, withdraw_asset_id);
+
+    int data_not_valid = (supply_asset_id == withdraw_asset_id) | (~ is_withdraw_asset_exist);
+
+    if (addresses_not_valid | custom_payload_not_valid | data_not_valid) {
+        msg_value -= (modest_fwd_fee_estimation(fwd_fee)
+            + fee::supply_withdraw_master
+            + get_compute_fee(constants::wc_master, gas_consumed())
+            + fee::unfinished_runtime_gas
+            + storage_fees());
+
+        int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+        int error_code = addresses_not_valid ? error::invalid_address_provided : custom_payload_not_valid ? error::custom_response_payload_too_big : error::invalid_data;
+        respond_send_jetton(
+            master_jw_address, initial_sender,
+            query_id, jetton_amount,
+            begin_cell().store_op_code(error_code).store_query_id(query_id).store_ref(custom_response_payload_extended).end_cell(), forward_ton_amount
+        );
+        return ();
+    }
+
+    asset_dynamics_collection = supply_withdraw_jetton(
+        query_id,
+        user_version, include_user_code ? user_code : null(),
+        asset_config_collection, asset_dynamics_collection,
+        initial_sender,
+        supply_amount, supply_asset_id,
+        withdraw_amount, withdraw_asset_id, recipient_address_of_withdraw, null(),
+        msg_value, fwd_fee, ton_amount_for_repay_remainings, custom_response_payload_extended, subaccount_id, return_repay_remainings_flag, custom_payload_saturation_flag
+    );
+
+    master::storage::save(
+        meta, upgrade_config,
+        asset_config_collection, 
+        if_active, oracles_info, admin, tokens_keys, 
+        asset_dynamics_collection, supervisor
+    );
+
+    return ();
+}
+
+() supply_withdraw_master_jetton_request_process(
+    int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+    slice master_jw_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+    cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor, ;; storage params
+    int jetton_op_code, int query_id, int jetton_amount, slice initial_sender, int user_version, cell user_code ;; jetton tx body params
+) impure inline {
+    cell prices_data_args = in_msg_body~load_ref();
+    cell evaa_operation_cell = in_msg_body~load_ref();
+
+    (
+        _, _, int withdraw_asset_id, slice recipient_address_of_withdraw,
+        _, _, _, cell custom_response_payload, _, _, _
+    ) = parse_supply_withdraw_master_message(evaa_operation_cell.begin_parse(), true);
+
+    (slice supply_token_id, int found) = tokens_keys.udict_get?(256, addr_hash);
+    int supply_asset_id = supply_token_id~load_asset_id();
+    int supply_amount = jetton_amount;
+
+    (cell prices_packed, cell target_feeds, int feeds_len, int min_publish_gap, int max_staleness) = unpack_prices_data_args(prices_data_args);
+
+    slice custom_response_payload_open = custom_response_payload.begin_parse();
+    cell custom_response_payload_extended = custom_response_payload;
+    ifnot (custom_response_payload_open.slice_empty?()) {
+        custom_response_payload_extended = begin_cell()
+				.store_slice(initial_sender)
+				.store_ref(custom_response_payload)
+			.end_cell(); 
+    }
+
+    ;; check msg_value is enough for paying pyth fees
+    var (pyth_address, _, _, pyth_compute_base_gas, pyth_compute_per_update_gas, pyth_single_update_fee) = parse_oracles_info(oracles_info.begin_parse());
+    int required_fee = calculate_pyth_update_fee(pyth_compute_base_gas, pyth_compute_per_update_gas, pyth_single_update_fee,feeds_len);
+
+    int addresses_not_valid = ~ is_valid_address?(recipient_address_of_withdraw);
+    int custom_payload_not_valid = ~ is_valid_custom_response_payload?(custom_response_payload);
+    (_, int is_withdraw_asset_exist) = asset_config_collection.udict_get?(256, withdraw_asset_id);
+    int data_not_valid = (supply_asset_id == withdraw_asset_id) | (~ is_withdraw_asset_exist);
+    int fee_not_enough = msg_value < required_fee;
+
+    if (addresses_not_valid | custom_payload_not_valid | data_not_valid | fee_not_enough) {
+        msg_value -= (modest_fwd_fee_estimation(fwd_fee)
+            + fee::supply_withdraw_master
+            + get_compute_fee(constants::wc_master, gas_consumed())
+            + fee::unfinished_runtime_gas
+            + storage_fees());
+
+        int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+        int error_code = addresses_not_valid ? error::invalid_address_provided :
+                            data_not_valid ? error::invalid_data :
+                            custom_payload_not_valid ? error::custom_response_payload_too_big :
+                            error::pyth_feeds_update_transaction_fees;
+        respond_send_jetton(
+            master_jw_address, initial_sender,
+            query_id, supply_amount,
+            begin_cell().store_op_code(error_code).store_query_id(query_id).store_ref(custom_response_payload_extended).end_cell(), forward_ton_amount
+        );
+        return ();
+    }
+
+    ;; pack payload and send to pyth
+    cell operation_body = begin_cell()
+                         .store_ref(evaa_operation_cell)
+                         .store_slice(master_jw_address)
+                         .store_amount(supply_amount)
+                         .store_slice(initial_sender)
+                         .end_cell();
+
+    cell operation_payload = begin_cell()
+                            .store_op_code(op::supply_withdraw_master_jetton)
+                            .store_uint(query_id, 64)
+                            .store_ref(operation_body)
+                            .end_cell();
+
+    request_price_feeds(pyth_address, min_publish_gap, max_staleness, prices_packed, target_feeds, operation_payload);
+
+    master::storage::save(
+        meta, upgrade_config,
+        asset_config_collection,
+        if_active, oracles_info, admin, tokens_keys,
+        asset_dynamics_collection, supervisor
+    );
+
+    return ();
+}
+
+() supply_withdraw_unsatisfied_process(
+    int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+    slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+    cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor, ;; storage params
+    int op, int query_id ;; trx body
+) impure inline {
+    (
+        slice owner_address,
+        int supply_amount, int supply_asset_id,
+        int ton_amount_for_repay_remainings, cell custom_response_payload, int subaccount_id
+    ) = parse_supply_withdraw_unsatisfied_message(in_msg_body);
+
+    ;; Verify this is a message from lending-user smart contract
+    throw_unless(
+        error::supply_withdraw_unsatisfied_fake_sender,
+        slice_data_equal?(
+            sender_address,
+            calculate_user_address(BLANK_CODE(), owner_address, subaccount_id)
+        )
+    );
+    
+    ;; supply section
+    {
+        (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(supply_asset_id);
+
+        int supply_withdraw_unsatisfied_fees = modest_fwd_fee_estimation(fwd_fee) + fee::supply_withdraw_unsatisfied;
+        msg_value -= supply_withdraw_unsatisfied_fees;
+
+        msg_value -= (get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
+
+        int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+        send_asset_ext(
+            owner_address, query_id,
+            jw_address_hash, supply_amount,
+            forward_ton_amount,
+            pack_supply_withdraw_excess_message_with_data(op::supply_withdraw_fail, query_id, custom_response_payload),
+            sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE 
+        );
+    }
+
+    master::storage::save(
+        meta, upgrade_config,
+        asset_config_collection,
+        if_active, oracles_info, admin, tokens_keys,
+        asset_dynamics_collection, supervisor
+    );
+    
+    return ();
+}
+
+() supply_withdraw_satisfied_process(
+    my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+    sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+    meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
+    op, query_id ;; trx body
+) impure inline {
+    (
+        slice owner_address,
+        int supply_amount, int supply_asset_id, int supply_new_principal, int repay_amount_principal, int supply_amount_principal,
+        int withdraw_amount, int withdraw_asset_id, slice recipient_address_of_withdraw, int withdraw_new_principal, int borrow_amount_principal, int reclaim_amount_principal,
+        int ton_amount_for_repay_remainings, cell custom_response_payload, int subaccount_id, int return_repay_remainings_flag, int custom_payload_saturation_flag
+    )
+    = parse_supply_withdraw_satisfied_message(in_msg_body);
+
+    ;; Verify this is a message from lending-user smart contract
+    int user_version = upgrade_config.upgrade_config:user_code_version();
+    throw_unless(
+        error::supply_withdraw_satisfied_fake_sender,
+        slice_data_equal?(
+            sender_address,
+            calculate_user_address(BLANK_CODE(), owner_address, subaccount_id)
+        )
+    );
+
+    ;; supply section
+    int new_total_supply_in = 0;
+    int new_total_borrow_in = 0;
+    int s_rate_in = 0;
+    int b_rate_in = 0;
+    int repay_remainings_present = 0;
+    if(supply_amount != 0) {
+        (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, int max_token_amount, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(supply_asset_id);
+
+        (
+            s_rate_in, b_rate_in,
+            int total_supply_principal, int total_borrow_principal,
+            int last_accrual, int token_balance,
+            int tracking_supply_index, int tracking_borrow_index,
+            int awaited_supply
+        ) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(supply_asset_id);
+
+        int awaited_supply_principal = principal_value_supply_calc(s_rate_in, awaited_supply);
+
+        int awaited_total_supply_principal = total_supply_principal + awaited_supply_principal + supply_amount_principal;
+
+        if ((awaited_total_supply_principal > max_token_amount) & (max_token_amount != 0) & (supply_amount_principal > 0)) {
+            int satisfied_message_fee = modest_fwd_fee_estimation(fwd_fee) + fee::supply_withdraw_satisfied;
+            msg_value -= satisfied_message_fee;
+
+            msg_value -= (get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
+
+            send_message_to_evaa_user_sc_by_address(
+                null(), satisfied_message_fee, ;; state_init don't need
+                user_version, null(), ;; null upgrade_info
+                sender_address, pack_supply_withdraw_fail_message(
+                    query_id,
+                    supply_asset_id, repay_amount_principal + supply_amount_principal,
+                    withdraw_asset_id, borrow_amount_principal + reclaim_amount_principal,
+                    subaccount_id
+                ), sendmode::REGULAR
+            );
+
+            if (supply_asset_id == constants::ton_asset_id){
+                raw_reserve(supply_amount, reserve::INCREASE_BY_ORIGINAL_BALANCE | reserve::NEGATE_AMOUNT);
+            } else {
+                raw_reserve(0, reserve::INCREASE_BY_ORIGINAL_BALANCE);
+            }
+            
+            int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+            send_asset_ext(
+                owner_address, query_id,
+                jw_address_hash, supply_amount,
+                forward_ton_amount,
+                pack_supply_withdraw_excess_message_with_data(op::supply_withdraw_fail, query_id, custom_response_payload),
+                sendmode::CARRY_ALL_BALANCE 
+            );
+
+            return ();
+        }
+
+        if (return_repay_remainings_flag & (repay_amount_principal > 0) & (supply_amount_principal > 0)) { ;; related to repay remainings
+            repay_remainings_present = present_value(s_rate_in, b_rate_in, supply_amount_principal);
+            supply_amount_principal = 0;
+        }
+
+        new_total_supply_in = total_supply_principal + supply_amount_principal;
+        new_total_borrow_in = total_borrow_principal - repay_amount_principal;
+    
+        asset_dynamics_collection~asset_dynamics_collection:set_packed(
+            supply_asset_id,
+            s_rate_in, b_rate_in,
+            new_total_supply_in, new_total_borrow_in,
+            last_accrual, token_balance + (supply_amount - repay_remainings_present),
+            tracking_supply_index, tracking_borrow_index,
+            awaited_supply
+        );
+    }
+
+    ;; borrow section
+    int new_total_supply_out = 0;
+    int new_total_borrow_out = 0;
+    int s_rate_out = 0;
+    int b_rate_out = 0;
+    {
+        (
+            s_rate_out, int b_rate_out,
+            int total_supply_principal, int total_borrow_principal,
+            int last_accrual, int token_balance, int tracking_supply_index, int tracking_borrow_index,
+            int awaited_supply
+        )
+        = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(withdraw_asset_id);
+
+        int asset_liquidity_minus_reserves = get_asset_liquidity_minus_reserves(
+            total_supply_principal, total_borrow_principal,
+            s_rate_out, b_rate_out, token_balance
+        );
+
+        int asset_liquidity = token_balance;
+        int borrow_amount_present = present_value_borrow_calc(b_rate_out, borrow_amount_principal);
+
+        (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, int borrow_cap, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(withdraw_asset_id);
+
+        if ((withdraw_amount > asset_liquidity) | (borrow_amount_present > asset_liquidity_minus_reserves) | ((borrow_amount_principal + total_borrow_principal > borrow_cap) & (borrow_cap >= 0))) { ;; withdraw fail
+            int satisfied_message_fee = modest_fwd_fee_estimation(fwd_fee) + fee::supply_withdraw_satisfied;
+
+            msg_value -= satisfied_message_fee;
+
+            msg_value -= (get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
+
+            send_message_to_evaa_user_sc_by_address(
+                null(), satisfied_message_fee, ;; state_init don't need
+                user_version, null(), ;; null upgrade_info
+                sender_address, pack_supply_withdraw_fail_message(
+                    query_id,
+                    supply_asset_id, repay_amount_principal + supply_amount_principal,
+                    withdraw_asset_id, borrow_amount_principal + reclaim_amount_principal,
+                    subaccount_id
+                ), sendmode::REGULAR
+            );
+
+            if (supply_asset_id == constants::ton_asset_id){
+                raw_reserve(supply_amount, reserve::INCREASE_BY_ORIGINAL_BALANCE | reserve::NEGATE_AMOUNT);
+            } else {
+                raw_reserve(0, reserve::INCREASE_BY_ORIGINAL_BALANCE);
+            }
+
+            (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(supply_asset_id);
+
+            int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+            send_asset_ext(
+                owner_address, query_id,
+                jw_address_hash, supply_amount,
+                forward_ton_amount,
+                pack_supply_withdraw_excess_message_with_data(op::supply_withdraw_fail, query_id, custom_response_payload),
+                sendmode::CARRY_ALL_BALANCE 
+            );
+
+            return ();
+        }
+
+        new_total_supply_out = total_supply_principal - reclaim_amount_principal;
+        new_total_borrow_out = total_borrow_principal + borrow_amount_principal;
+
+        asset_dynamics_collection~asset_dynamics_collection:set_packed(
+            withdraw_asset_id,
+            s_rate_out, b_rate_out,
+            new_total_supply_out, new_total_borrow_out,
+            last_accrual, token_balance - withdraw_amount,
+            tracking_supply_index, tracking_borrow_index,
+            awaited_supply
+        );
+    }
+
+    int success_message_fee = modest_fwd_fee_estimation(fwd_fee) + fee::supply_withdraw_success;
+    msg_value -= success_message_fee;
+
+    send_message_to_evaa_user_sc_by_address(
+        null(), success_message_fee, ;; state_init don't need
+        user_version, null(), ;; null upgrade_info
+        sender_address, pack_supply_withdraw_success_message(
+            query_id,
+            supply_asset_id, repay_amount_principal + supply_amount_principal,
+            withdraw_asset_id, borrow_amount_principal + reclaim_amount_principal,
+            asset_config_collection, asset_dynamics_collection, subaccount_id
+        ), sendmode::REGULAR
+    );
+
+    cell log_data = begin_cell()
+    .store_uint(log::supply_withdraw_success, 8) ;; withdraw code
+    .store_slice(owner_address) ;; user addr
+    .store_slice(sender_address) ;; user sc addr
+    .store_slice(recipient_address_of_withdraw) ;; recipient_address 
+    .store_uint(now(), 32) ;; current time
+    .store_ref(begin_cell().end_cell()) ;; supply asset data (nothic cause its withdraw)
+    ;; asset in logs
+    .store_ref(begin_cell() ;; attached redeemed asset data
+        .store_uint(supply_asset_id, 256) 
+        .store_uint(supply_amount - repay_remainings_present, 64) 
+        .store_int(supply_new_principal, 64) 
+        .store_int(new_total_supply_in, 64) 
+        .store_int(new_total_borrow_in, 64) 
+        .store_uint(s_rate_in, 64) 
+        .store_uint(b_rate_in, 64) 
+        .end_cell())
+    ;; asset out logs
+    .store_ref(begin_cell() ;; attached redeemed asset data
+        .store_uint(withdraw_asset_id, 256) 
+        .store_uint(withdraw_amount, 64) 
+        .store_int(withdraw_new_principal, 64) 
+        .store_int(new_total_supply_out, 64) 
+        .store_int(new_total_borrow_out, 64) 
+        .store_uint(s_rate_out, 64) 
+        .store_uint(b_rate_out, 64) 
+        .end_cell())
+    .end_cell();
+
+    emit_log_simple(log_data);
+
+    if(repay_remainings_present > 0) {
+        (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(supply_asset_id);
+
+        int forward_ton_amount_for_repay_remainings = ton_amount_for_repay_remainings - fee::jetton_transfer;
+
+        msg_value -= ton_amount_for_repay_remainings;
+
+        send_asset_ext_with_specified_fee(
+            owner_address, query_id,
+            jw_address_hash, repay_remainings_present,
+            ton_amount_for_repay_remainings, forward_ton_amount_for_repay_remainings,
+            pack_supply_withdraw_satisfied_and_repay_remainings_message(query_id),
+            sendmode::REGULAR
+        );
+    }
+    
+    msg_value -= (get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
+
+    if ((repay_remainings_present > 0) & (supply_asset_id == constants::ton_asset_id)) {
+        raw_reserve(repay_remainings_present, reserve::INCREASE_BY_ORIGINAL_BALANCE | reserve::NEGATE_AMOUNT);
+    } elseif (withdraw_asset_id == constants::ton_asset_id){
+        raw_reserve(withdraw_amount, reserve::INCREASE_BY_ORIGINAL_BALANCE | reserve::NEGATE_AMOUNT);
+    } else {
+        raw_reserve(0, reserve::INCREASE_BY_ORIGINAL_BALANCE);
+    }
+
+    if (custom_payload_saturation_flag) {
+        slice custom_response_payload_open = custom_response_payload.begin_parse();
+        custom_response_payload = begin_cell()
+                          .store_ref(custom_response_payload_open~load_ref()) ;; custom response payload
+                          .store_ref(begin_cell()
+                                    .store_slice(custom_response_payload_open~load_ref().begin_parse()) ;; user_principals
+                                    .store_dict(asset_dynamics_collection)
+                                    .store_dict(asset_config_collection)
+                                    .end_cell())
+                          .end_cell();
+    }
+    
+    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(withdraw_asset_id);
+
+    int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+    send_asset_ext(
+        recipient_address_of_withdraw, query_id,
+        jw_address_hash, withdraw_amount,
+        forward_ton_amount,
+        pack_supply_withdraw_excess_message_with_data(op::supply_withdraw_success, query_id, custom_response_payload),
+        sendmode::CARRY_ALL_BALANCE 
+    );
+
+    master::storage::save(
+        meta, upgrade_config,
+        asset_config_collection, 
+        if_active, oracles_info, admin, tokens_keys, 
+        asset_dynamics_collection, supervisor
+    );
+
+    return ();
+}
+
+() supply_withdraw_unsatisfied_handle_exception(
+    int my_balance, int msg_value, slice in_msg_body, slice sender_address, int fwd_fee,
+    cell upgrade_config, cell asset_config_collection, int query_id
+) impure inline {
+    (
+        slice owner_address,
+        int supply_amount, int supply_asset_id,
+        int ton_amount_for_repay_remainings, cell custom_response_payload, int subaccount_id
+    ) = parse_supply_withdraw_unsatisfied_message(in_msg_body);
+
+    ;; supply section
+    {
+        (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+            _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(supply_asset_id);
+
+        int supply_withdraw_fail_fees = modest_fwd_fee_estimation(fwd_fee) + fee::supply_withdraw_fail;
+        msg_value -= supply_withdraw_fail_fees;
+
+        msg_value -= (get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
+
+        int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+        send_asset_ext(
+            owner_address, query_id,
+            jw_address_hash, supply_amount,
+            forward_ton_amount,
+            pack_supply_withdraw_excess_message_with_data(op::supply_withdraw_fail, query_id, custom_response_payload),
+            sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE 
+        );
+    }
+    
+    return ();
+}
+
+() supply_withdraw_satisfied_handle_exception(
+    int my_balance, int msg_value, slice in_msg_body, slice sender_address, int fwd_fee,
+    cell upgrade_config, cell asset_config_collection, int query_id
+) impure inline {
+    (
+        slice owner_address,
+        int supply_asset_id, int supply_amount, int supply_new_principal, int repay_amount_principal, int supply_amount_principal,
+        int withdraw_asset_id, int withdraw_amount, slice recipient_address_of_withdraw, int withdraw_new_principal, int borrow_amount_principal, int reclaim_amount_principal, 
+        int ton_amount_for_repay_remainings, cell custom_response_payload, int subaccount_id, int return_repay_remainings_flag, int custom_payload_saturation_flag
+    ) = parse_supply_withdraw_satisfied_message(in_msg_body);
+
+    int user_version = upgrade_config.upgrade_config:user_code_version();
+
+    int fail_message_fee = modest_fwd_fee_estimation(fwd_fee) + fee::supply_withdraw_fail;
+    msg_value -= fail_message_fee;
+    
+    msg_value -= (get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
+
+    send_message_to_evaa_user_sc_by_address(
+        null(), fail_message_fee, ;; state_init don't need
+        user_version, null(), ;; null upgrade_info
+        sender_address, pack_supply_withdraw_fail_message(
+            query_id,
+            supply_asset_id, repay_amount_principal + supply_amount_principal,
+            withdraw_asset_id, borrow_amount_principal + reclaim_amount_principal,
+            subaccount_id
+        ),
+        sendmode::REGULAR
+    );
+
+    if (supply_asset_id == constants::ton_asset_id){
+        raw_reserve(supply_amount, reserve::INCREASE_BY_ORIGINAL_BALANCE | reserve::NEGATE_AMOUNT);
+    } else {
+        raw_reserve(0, reserve::INCREASE_BY_ORIGINAL_BALANCE);
+    }
+
+    ;; Refund asset
+    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(supply_asset_id);
+
+    int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+    send_asset_ext(
+        owner_address, query_id,
+        jw_address_hash, supply_amount,
+        forward_ton_amount,
+        pack_supply_withdraw_excess_message_with_data(op::supply_withdraw_fail, query_id, custom_response_payload),
+        sendmode::CARRY_ALL_BALANCE 
+    );
+}
+
+;; return jettons and ton excesses to sender
+() supply_withdraw_handle_pyth_error_response(int query_id, int msg_value, int fwd_fee, int pyth_error_code, slice operation_body) impure inline {
+    ;; if we fail to unpack operation_body, should we report crash?
+      (slice evaa_operation_slice, slice master_jw_address, int addr_hash, int jetton_amount, slice initial_sender
+    ) = unpack_supply_withdraw_master_jetton(operation_body);
+
+    cell custom_response_payload = begin_cell().end_cell();
+  
+    (_, _, _, _, _, _, _, custom_response_payload, _, _, _) = parse_supply_withdraw_master_message(evaa_operation_slice, true);
+
+    slice custom_response_payload_open = custom_response_payload.begin_parse();
+    cell custom_response_payload_extended = custom_response_payload;
+    
+    ifnot (custom_response_payload_open.slice_empty?()) {
+        custom_response_payload_extended = begin_cell()
+                    .store_slice(initial_sender)
+                    .store_ref(custom_response_payload)
+                .end_cell(); 
+    }
+  
+    msg_value -= (modest_fwd_fee_estimation(fwd_fee)
+                + fee::supply_withdraw_master
+                + get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
+
+    int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+    send_asset_ext(initial_sender, query_id, addr_hash, jetton_amount, forward_ton_amount,
+        begin_cell()
+      .store_op_code(error::pyth_error_on_supply_withdraw)
+      .store_op_code(pyth_error_code)
+      .store_ref(custom_response_payload_extended)
+      .end_cell(),
+        sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
+    );
+}
+
+() supply_withdraw_master_ton_pyth_handle_exception(
+  slice sender_address, 
+  int query_id, int error_code, cell in_msg_full
+) impure inline {
+    send_message(
+        sender_address,
+        0,
+        begin_cell().store_op_code(error_code).store_query_id(query_id).store_ref(in_msg_full).end_cell(),
+        sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
+    );
+
+    return ();
+}

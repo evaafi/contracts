@@ -1,6 +1,3 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "../external/stdlib.fc";
 
 (slice, int) load_op_code(slice cs) inline {
@@ -11,7 +8,6 @@ builder store_op_code(builder b, int op_code) inline {
 	return b.store_uint(op_code, 32);
 }
 
-;; ??? How to store prices?
 builder store_price(builder b, int price) inline {
 	return b.store_uint(price, 64);
 }
@@ -37,13 +33,7 @@ builder store_asset_id(builder b, int asset_id) inline {
 }
 
 builder store_amount(builder b, int amount) inline {
-	;; I recommend to ensure that amount is non-negative here
 	return b.store_uint(amount, 64);
-	;; .load_amount is used in parse_liquidate_master_message
-	;; to store min_collateral_amount, which MUST be non-negative
-	;; (read the comment in parse_liquidate_master_message)
-	;; don't change to signed int
-	;; (or in case you need to - introduce necessary checks in the code)
 }
 
 (slice, int) load_amount(slice cs) inline {
@@ -58,7 +48,6 @@ builder store_balance(builder b, int balance) inline {
 	return cs.load_uint(64);
 }
 
-;; ??? How to store s_rate and b_rate?
 builder store_sb_rate(builder b, int sb_rate) inline {
 	return b.store_uint(sb_rate, 64);
 }
@@ -67,8 +56,6 @@ builder store_sb_rate(builder b, int sb_rate) inline {
 	return cs.load_uint(64);
 }
 
-;; ??? How to store principal amounts?
-;; (Note it at least can be negative)
 builder store_principal(builder b, int principal) inline {
 	return b.store_int(principal, 64);
 }
@@ -81,7 +68,6 @@ int preload_principal(slice cs) inline {
 	return cs.preload_int(64);
 }
 
-;; ??? Is timestamp always positive?
 builder store_timestamp(builder b, int timestamp) inline {
 	return b.store_uint(timestamp, 32);
 }

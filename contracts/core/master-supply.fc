@@ -1,6 +1,3 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "../constants/constants.fc";
 #include "../external/stdlib.fc";
 #include "../constants/errors.fc";
@@ -16,12 +13,13 @@ cell master_core_logic_supply_asset_unchecked(
   int query_id, int user_version, cell user_code,
   cell asset_config_collection, cell asset_dynamics_collection,
   int asset_id, slice owner_address, int amount,
-  int message_send_mode, int forward_ton_amount, cell custom_response_payload,
-  int fwd_fee, int msg_value_for_fee_check
+  int message_send_mode, cell custom_response_payload,
+  int fwd_fee, slice sender_address, slice initial_sender, int msg_value,
+  int subaccount_id, int return_repay_remainings_flag, slice custom_payload_recipient, int custom_payload_saturation_flag
 ) impure {
   ;; Update tracking indexes
-  (_, _, _, _, _, _, _, _, _, _, _, _, int dust, int max_token_amount, _, _, _, _, _
-  ) = asset_config_collection.asset_config_collection:get_unpacked(asset_id);
+  (_, _, _, _, _, _, _, _, _, _, _, _, int dust, int max_token_amount, _, _, _, _, _,
+    _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(asset_id);
 
   asset_dynamics_collection~update_old_rates_and_provided_asset_id(
     asset_config_collection, asset_id, 0
@@ -39,23 +37,47 @@ cell master_core_logic_supply_asset_unchecked(
     total_supply_principal + principal_value_supply_calc(s_rate, awaited_supply);
 
   cell supply_user_message = pack_supply_user_message(
-      query_id,
-      asset_id, amount,
-      s_rate, b_rate,
-      dust, max_token_amount,
-      total_supply_principal_with_awaited_supply, total_borrow_principal,
-      tracking_supply_index, tracking_borrow_index,
-      forward_ton_amount, custom_response_payload
-    );
+    query_id,
+    asset_id, amount,
+    s_rate, b_rate,
+    dust, max_token_amount,
+    total_supply_principal_with_awaited_supply, total_borrow_principal,
+    tracking_supply_index, tracking_borrow_index,
+    custom_response_payload,
+    subaccount_id, return_repay_remainings_flag, custom_payload_recipient, custom_payload_saturation_flag, initial_sender
+  );
 
   int awaited_supply_with_incoming_amount = awaited_supply + amount;
 
-  int enough_fee = supply_min_attachment(fwd_fee, supply_user_message) + forward_ton_amount;
+  int enough_fee = supply_min_attachment(fwd_fee, supply_user_message);
 
-  throw_unless(
-    error::incoming_asset_transaction_fees,
-    msg_value_for_fee_check > enough_fee
-  );
+  ;; note that for ton msg_value is already with deducted supply_amount
+  if (msg_value < enough_fee) {
+    cell body = begin_cell().store_op_code(error::incoming_asset_transaction_fees).store_query_id(query_id).store_ref(custom_response_payload).end_cell();
+    if (asset_id == constants::ton_asset_id) {
+      ;; Original balance of SC was already reserved
+      send_message(
+        sender_address,
+        0,
+        body,
+        message_send_mode
+      );
+    } else {
+      msg_value -= (get_compute_fee(constants::wc_master, gas_consumed())
+          + fee::unfinished_runtime_gas
+          + storage_fees());
+
+      int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+      ;; mode = 64, but no reserve was issued at this point
+      respond_send_jetton(
+        sender_address, initial_sender,
+        query_id, amount,
+        body, forward_ton_amount
+      );
+    }
+    return asset_dynamics_collection;
+  }
 
   asset_dynamics_collection~asset_dynamics_collection:set_packed(
     asset_id,
@@ -66,10 +88,15 @@ cell master_core_logic_supply_asset_unchecked(
     awaited_supply_with_incoming_amount
   );
 
-  send_message_to_lending_wallet(
+  if (asset_id == constants::ton_asset_id) {
+    raw_reserve(amount, reserve::REGULAR); ;; additionaly, reserve supplied amount
+  }
+
+  send_message_to_evaa_user_sc(
     BLANK_CODE(), user_version, user_code, owner_address,
     supply_user_message,
-    message_send_mode
+    message_send_mode,
+    subaccount_id
   );
 
   return asset_dynamics_collection;
@@ -78,44 +105,59 @@ cell master_core_logic_supply_asset_unchecked(
 cell supply_jetton(
   int query_id, int user_version, cell user_code,
   cell asset_config_collection, cell asset_dynamics_collection,
-  int msg_value, int fwd_fee,
-  int asset_id, slice owner_address, int amount, int forward_ton_amount, cell custom_response_payload
+  slice sender_address, slice initial_sender, int msg_value, int fwd_fee,
+  int asset_id, slice owner_address, int amount, cell custom_response_payload,
+  int subaccount_id, int return_repay_remainings_flag, slice custom_payload_recipient, int custom_payload_saturation_flag
 ) impure inline {
   return master_core_logic_supply_asset_unchecked(
     query_id, user_version, user_code,
     asset_config_collection, asset_dynamics_collection,
-    asset_id, owner_address, amount, 64, forward_ton_amount, custom_response_payload,
-    fwd_fee, msg_value + 1 ;; offset by 1 because inside comparison is strict
+    asset_id, owner_address, amount, sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE, custom_response_payload,
+    fwd_fee, sender_address, initial_sender, msg_value,
+    subaccount_id, return_repay_remainings_flag, custom_payload_recipient, custom_payload_saturation_flag
   );
 }
 
 () supply_master_jetton_process  (
   int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
   slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
-  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
-  int jetton_op_code, int query_id, int jetton_amount, slice from_address, int user_version, cell user_code ;; jetton tx body params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor, ;; storage params
+  int jetton_op_code, int query_id, int jetton_amount, slice initial_sender, int user_version, cell user_code ;; jetton tx body params
 ) impure inline {
-  int include_user_code = in_msg_body~load_bool_ext();
   (slice token_id, int found) = tokens_keys.udict_get?(256, addr_hash);
-  slice recipient_address = in_msg_body~load_msg_addr();
-	int forward_ton_amount = in_msg_body~load_amount();
-  cell custom_response_payload = in_msg_body~load_ref();
-  in_msg_body.end_parse();
 
-  ifnot (is_valid_address?(recipient_address)) {
-    respond_send_jetton(
-      sender_address, from_address,
-      query_id, jetton_amount,
-      begin_cell().store_op_code(error::invalid_address_provided).end_cell(), 0
-    );
-    return ();
+  (int include_user_code, slice recipient_address,
+    cell custom_response_payload, int subaccount_id, int return_repay_remainings_flag, slice custom_payload_recipient, int custom_payload_saturation_flag) = parse_master_supply_jetton_message(in_msg_body);
+
+  if(custom_payload_recipient.null?()) {
+    custom_payload_recipient = initial_sender;
   }
 
-  ifnot (is_valid_custom_response_payload?(custom_response_payload)) {
+  slice custom_response_payload_open = custom_response_payload.begin_parse();
+  cell custom_response_payload_extended = custom_response_payload;
+
+  ifnot (custom_response_payload_open.slice_empty?()) {
+    custom_response_payload_extended = begin_cell()
+				.store_slice(sender_address)
+				.store_ref(custom_response_payload)
+			.end_cell();
+  }
+
+  int addresses_not_valid = ~ (is_valid_address?(recipient_address) & is_valid_address?(custom_payload_recipient));
+  int custom_payload_not_valid = ~ is_valid_custom_response_payload?(custom_response_payload);
+
+  if (addresses_not_valid | custom_payload_not_valid) {
+    int error_code = addresses_not_valid ? error::invalid_address_provided : error::custom_response_payload_too_big;
+    msg_value -= (get_compute_fee(constants::wc_master, gas_consumed())
+      + fee::unfinished_runtime_gas
+      + storage_fees());
+
+    int forward_ton_amount = msg_value - fee::jetton_transfer;
+
     respond_send_jetton(
-      sender_address, from_address,
+      sender_address, initial_sender,
       query_id, jetton_amount,
-      begin_cell().store_op_code(error::custom_response_payload_too_big).end_cell(), 0
+      begin_cell().store_op_code(error_code).store_query_id(query_id).store_ref(custom_response_payload_extended).end_cell(), forward_ton_amount
     );
     return ();
   }
@@ -123,15 +165,17 @@ cell supply_jetton(
   asset_dynamics_collection = supply_jetton(
     query_id, user_version, include_user_code ? user_code : null(),
     asset_config_collection, asset_dynamics_collection,
-    msg_value, fwd_fee,
+    sender_address, initial_sender, msg_value, fwd_fee,
     token_id~load_asset_id(), ;; jetton_master_address, <- I am not sure we want this transformation anymore
-    recipient_address, jetton_amount, forward_ton_amount, custom_response_payload
+    recipient_address, jetton_amount, custom_response_payload_extended,
+    subaccount_id, return_repay_remainings_flag, custom_payload_recipient, custom_payload_saturation_flag
   );
+
   master::storage::save(
     meta, upgrade_config,
     asset_config_collection, 
     if_active, oracles_info, admin, tokens_keys,
-    asset_dynamics_collection
+    asset_dynamics_collection, supervisor
   );
   return ();
 }
@@ -139,54 +183,79 @@ cell supply_jetton(
 cell supply_ton(
   int query_id, int user_version, cell user_code,
   cell asset_config_collection, cell asset_dynamics_collection,
-  int msg_value, int supply_amount, int fwd_fee,
-  slice owner_address, int forward_ton_amount, cell custom_response_payload
+  slice sender_address, int msg_value, int supply_amount, int fwd_fee,
+  slice owner_address, cell custom_response_payload,
+  int subaccount_id, int return_repay_remainings_flag, slice custom_payload_recipient, int custom_payload_saturation_flag
 ) impure inline {
-  ;; Withhold some amount of TONs for blockchain fees
-  raw_reserve(supply_amount, reserve::AT_MOST + 2);
+  ;; Reserve original balance of the contract
+  raw_reserve(0, reserve::INCREASE_BY_ORIGINAL_BALANCE);
   return master_core_logic_supply_asset_unchecked(
     query_id, user_version, user_code,
     asset_config_collection, asset_dynamics_collection,
     constants::ton_asset_id, owner_address, supply_amount,
     sendmode::CARRY_ALL_BALANCE, ;; <- in combination with raw_reserve with mode=4
     ;;^ should resend the whole value of the original message minus "amount" and fees
-    forward_ton_amount, custom_response_payload,
-    fwd_fee, msg_value - supply_amount
+    custom_response_payload,
+    fwd_fee, sender_address, sender_address, msg_value - supply_amount,
+    subaccount_id, return_repay_remainings_flag, custom_payload_recipient, custom_payload_saturation_flag
   );
 }
 
 () supply_master_process  (
   int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
   slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
-  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor, ;; storage params
   int op, int query_id ;; trx body
 ) impure inline {
   (
     _, int user_version, _, _, _, cell user_code, _, _
   ) = upgrade_config.unpack_upgrade_config();
-  int include_user_code = in_msg_body~load_bool_ext(); ;; bool
 
-  int supply_amount = in_msg_body~load_amount();
-  slice recipient_address = in_msg_body~load_msg_addr();
-	int forward_ton_amount = in_msg_body~load_amount();
-  cell custom_response_payload = in_msg_body~load_ref();
-  in_msg_body.end_parse();
+  (int include_user_code, int supply_amount, slice recipient_address,
+    cell custom_response_payload, int subaccount_id, int return_repay_remainings_flag, slice custom_payload_recipient, int custom_payload_saturation_flag) = parse_master_supply_ton_message(in_msg_body);
 
-  throw_unless(error::invalid_address_provided, is_valid_address?(recipient_address));
-  throw_unless(error::custom_response_payload_too_big, is_valid_custom_response_payload?(custom_response_payload));
+  if(custom_payload_recipient.null?()) {
+    custom_payload_recipient = sender_address;
+  }
+
+  slice custom_response_payload_open = custom_response_payload.begin_parse();
+  cell custom_response_payload_extended = custom_response_payload;
+
+  ifnot (custom_response_payload_open.slice_empty?()) {
+    custom_response_payload_extended = begin_cell()
+				.store_slice(sender_address)
+				.store_ref(custom_response_payload)
+			.end_cell(); 
+  }
+  
+  (_, int is_ton_supported) = asset_config_collection.udict_get?(256, constants::ton_asset_id);
+  int addresses_not_valid = ~ (is_valid_address?(recipient_address) & is_valid_address?(custom_payload_recipient));
+  int custom_payload_not_valid = ~ is_valid_custom_response_payload?(custom_response_payload);
+
+  if (addresses_not_valid | custom_payload_not_valid | (~ is_ton_supported)) {
+    int error_code = addresses_not_valid ? error::invalid_address_provided : (~ is_ton_supported) ? error::ton_unsupported : error::custom_response_payload_too_big;
+    send_message(
+      sender_address,
+      0,
+      begin_cell().store_op_code(error_code).store_query_id(query_id).store_ref(custom_response_payload_extended).end_cell(),
+      sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
+    );
+    return ();
+  }
 
   asset_dynamics_collection = supply_ton(
-     query_id, user_version, include_user_code ? user_code : null(),
+    query_id, user_version, include_user_code ? user_code : null(),
     asset_config_collection, asset_dynamics_collection,
-    msg_value, supply_amount, fwd_fee,
-    recipient_address, forward_ton_amount, custom_response_payload
+    sender_address, msg_value, supply_amount, fwd_fee,
+    recipient_address, custom_response_payload_extended,
+    subaccount_id, return_repay_remainings_flag, custom_payload_recipient, custom_payload_saturation_flag
   );
 
   master::storage::save(
     meta, upgrade_config,
     asset_config_collection, 
     if_active, oracles_info, admin, tokens_keys,
-    asset_dynamics_collection
+    asset_dynamics_collection, supervisor
   );
   return ();
 }
@@ -194,12 +263,12 @@ cell supply_ton(
 () supply_success_process (
   int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
   slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
-  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor, ;; storage params
   int op, int query_id ;; trx body
 ) impure inline {
   (slice owner_address, ;; add new user principal to log
     int asset_id, int amount_supplied, int user_new_principal,
-    int repay_amount_principal, int supply_amount_principal, cell custom_response_payload) = parse_supply_success_message(in_msg_body);
+    int repay_amount_principal, int supply_amount_principal, cell custom_response_payload, int subaccount_id, int return_repay_remainings_flag, slice custom_payload_recipient, int custom_payload_saturation_flag) = parse_supply_success_message(in_msg_body);
 
   ;; Verify this is a message from lending-user smart contract
 
@@ -207,16 +276,23 @@ cell supply_ton(
     error::supply_success_fake_sender,
     slice_data_equal?(
       sender_address,
-      calculate_user_address(BLANK_CODE(), owner_address)
+      calculate_user_address(BLANK_CODE(), owner_address, subaccount_id)
     )
   );
 
-  (int s_rate, int b_rate,
-   int total_supply_principal, int total_borrow_principal,
-   int last_accrual, int token_balance,
-   int tracking_supply_index, int tracking_borrow_index,
-   int awaited_supply
+  (
+    int s_rate, int b_rate,
+    int total_supply_principal, int total_borrow_principal,
+    int last_accrual, int token_balance,
+    int tracking_supply_index, int tracking_borrow_index,
+    int awaited_supply
   ) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+
+  int repay_remainings_present = 0;
+  if (return_repay_remainings_flag & (repay_amount_principal > 0) & (supply_amount_principal > 0)) { ;; related to repay remainings
+    repay_remainings_present = present_value_supply_calc(s_rate, supply_amount_principal);
+    supply_amount_principal = 0;
+  }
 
   int new_total_supply = total_supply_principal + supply_amount_principal;
   int new_total_borrow = total_borrow_principal - repay_amount_principal;
@@ -229,13 +305,11 @@ cell supply_ton(
     new_total_supply,
     new_total_borrow,
     last_accrual,
-    token_balance + amount_supplied, ;; update asset balance
-    ;; ^ We couldn't update it when receiving Supply,
-    ;; because there is no guarantee it would succeed
+    token_balance + (amount_supplied - repay_remainings_present),
     tracking_supply_index, tracking_borrow_index,
     new_awaited_supply
   );
-  
+
   cell log_data = begin_cell()
     .store_uint(log::supply_success, 8) ;; supply code
     .store_slice(owner_address) ;; user addr
@@ -243,52 +317,101 @@ cell supply_ton(
     .store_uint(now(), 32) ;; current time
     .store_ref(begin_cell() ;; attached asset data
       .store_uint(asset_id, 256) 
-      .store_uint(amount_supplied, 64) 
+      .store_uint(amount_supplied - repay_remainings_present, 64)
       .store_int(user_new_principal, 64) 
       .store_int(new_total_supply, 64) 
       .store_int(new_total_borrow, 64) 
       .store_uint(s_rate, 64) 
-      .store_uint(b_rate, 64) 
+      .store_uint(b_rate, 64)
       .end_cell())
     .store_ref(begin_cell().end_cell()) ;; redeemed asset data (nothic cause its supply)
     .end_cell();
 
-    emit_log_simple(log_data);
+  emit_log_simple(log_data);
 
-    ;; deducting fee::log_tx is NOT neccessary because raw_reserve mode 4 accounts for action phase
-    ;;   (including logs - external out messages) fees
+  ;; deducting fee::log_tx is NOT neccessary because raw_reserve mode 4 accounts for action phase
+  ;;   (including logs - external out messages) fees
 
-    raw_reserve(0, 4);
-
-  cell body = pack_supply_success_excess_message();
-  slice custom_response_payload_open = custom_response_payload.begin_parse();
-  ifnot (custom_response_payload_open.slice_empty?()) {
-    body = pack_supply_excess_message_with_data(query_id, custom_response_payload);
+  if (custom_payload_saturation_flag) {
+    slice custom_response_payload_open = custom_response_payload.begin_parse();
+    custom_response_payload = begin_cell()
+                          .store_ref(custom_response_payload_open~load_ref()) ;; custom response payload
+                          .store_ref(begin_cell()
+                                    .store_slice(custom_response_payload_open~load_ref().begin_parse()) ;; user_principals + user_rewards
+                                    .store_dict(asset_dynamics_collection)
+                                    .store_dict(asset_config_collection)
+                                    .end_cell())
+                          .end_cell();
   }
 
-  send_message(
-    owner_address,
-    0,
-    body,
-    sendmode::CARRY_ALL_BALANCE 
-  );
+  if (repay_remainings_present > 0) {
+    int supply_success_fees = modest_fwd_fee_estimation(fwd_fee) + fee::supply_success;
+
+    msg_value -= supply_success_fees;
+
+    msg_value -= (get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas 
+                + storage_fees());
+
+    if (asset_id == constants::ton_asset_id) {
+      raw_reserve(repay_remainings_present, reserve::INCREASE_BY_ORIGINAL_BALANCE | reserve::NEGATE_AMOUNT);
+    } else {
+      raw_reserve(0, reserve::INCREASE_BY_ORIGINAL_BALANCE);
+    }
+
+    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+      _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(asset_id);
+
+    cell body = pack_supply_success_and_repay_remainings_message();
+    slice custom_response_payload_open = custom_response_payload.begin_parse();
+    ifnot (custom_response_payload_open.slice_empty?()) {
+      body = pack_supply_excess_and_repay_remainings_message_with_data(query_id, custom_response_payload);
+    }
+
+    int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+    send_asset_ext(
+      custom_payload_recipient, query_id,
+      jw_address_hash, repay_remainings_present,
+      forward_ton_amount,
+      body,
+      sendmode::CARRY_ALL_BALANCE
+    );
+  }
+  else {
+    raw_reserve(0, reserve::INCREASE_BY_ORIGINAL_BALANCE);
+
+    cell body = pack_supply_success_excess_message();
+    slice custom_response_payload_open = custom_response_payload.begin_parse();
+    ifnot (custom_response_payload_open.slice_empty?()) {
+      body = pack_supply_excess_message_with_data(query_id, custom_response_payload);
+    }
+
+    send_message(
+      custom_payload_recipient,
+      0,
+      body,
+      sendmode::CARRY_ALL_BALANCE
+    );
+  }
 
   master::storage::save(
     meta, upgrade_config,
     asset_config_collection, 
     if_active, oracles_info, admin, tokens_keys,
-    asset_dynamics_collection
+    asset_dynamics_collection, supervisor
   );
+  
   return ();
 }
 
 () supply_fail_process  (
   int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
   slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
-  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor,;; storage params
   int op, int query_id ;; trx body
 ) impure inline {
-  var (owner_address, transferred_asset_id, transferred_amount, forward_ton_amount, custom_response_payload) = parse_supply_fail_message(in_msg_body);
+  var (owner_address, transferred_asset_id, transferred_amount, custom_response_payload, subaccount_id, return_repay_remainings_flag, initial_sender) = parse_supply_fail_message(in_msg_body);
 
   ;; Verify this is a message from lending-user smart contract
   
@@ -296,11 +419,12 @@ cell supply_ton(
     error::supply_fail_fake_sender,
     slice_data_equal?(
       sender_address,
-      calculate_user_address(BLANK_CODE(), owner_address)
+      calculate_user_address(BLANK_CODE(), owner_address, subaccount_id)
     )
   );
   
-  (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(transferred_asset_id);
+  (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+    _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(transferred_asset_id);
 
   (int s_rate, int b_rate,
     int total_supply_principal, int total_borrow_principal,
@@ -322,16 +446,21 @@ cell supply_ton(
 
   int supply_fail_fees = modest_fwd_fee_estimation(fwd_fee) + fee::supply_fail;
 
-  msg_value -= supply_fail_fees;
+  msg_value -= (supply_fail_fees
+              + get_compute_fee(constants::wc_master, gas_consumed())
+              + fee::unfinished_runtime_gas 
+              + storage_fees());
 
   if (transferred_asset_id == constants::ton_asset_id) {
-    raw_reserve(my_balance - transferred_amount - msg_value, reserve::REGULAR);
+    raw_reserve(transferred_amount, reserve::INCREASE_BY_ORIGINAL_BALANCE | reserve::NEGATE_AMOUNT);
   } else {
-    raw_reserve(0, 4);
+    raw_reserve(0, reserve::INCREASE_BY_ORIGINAL_BALANCE);
   }
   
+  int forward_ton_amount = msg_value - fee::jetton_transfer;
+
   send_asset_ext(
-    owner_address, query_id,
+    initial_sender, query_id,
     jw_address_hash, transferred_amount,
     forward_ton_amount,
     pack_supply_fail_message_with_data(query_id, custom_response_payload),
@@ -345,9 +474,8 @@ cell supply_ton(
     meta, upgrade_config,
     asset_config_collection,
     if_active, oracles_info, admin, tokens_keys,
-    asset_dynamics_collection
+    asset_dynamics_collection, supervisor
   );
 
   return ();
 }
-

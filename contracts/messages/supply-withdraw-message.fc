@@ -1,0 +1,401 @@
+#include "../external/stdlib.fc";
+#include "../external/ton.fc";
+#include "../data/basic-types.fc";
+#include "../constants/op-codes.fc";
+
+(slice, slice, int, int, slice) unpack_supply_withdraw_master_jetton(slice operation_payload) impure inline {
+	cell evaa_operation_cell = operation_payload~load_ref();
+	slice master_jw_address = operation_payload~load_msg_addr();
+	int jetton_amount = operation_payload~load_uint(64);
+	slice initial_sender = operation_payload~load_msg_addr();
+	operation_payload.end_parse();
+
+	var (_, addr_hash) = parse_std_addr(master_jw_address);
+	slice evaa_operation_slice = evaa_operation_cell.begin_parse();
+
+	return (evaa_operation_slice, master_jw_address, addr_hash, jetton_amount, initial_sender);
+}
+
+(int, int, int, slice, int, cell, int, cell, int, int, int) parse_supply_withdraw_master_message(slice in_msg_body, int is_jetton) {
+    slice supply_data = in_msg_body~load_ref().begin_parse();
+    slice withdraw_data = in_msg_body~load_ref().begin_parse();
+    slice general_data = in_msg_body~load_ref().begin_parse();
+
+    int supply_amount = 0;
+    ifnot (is_jetton) {
+        supply_amount = supply_data~load_amount();
+    }
+
+    int withdraw_amount = withdraw_data~load_amount();
+    int withdraw_asset_id = withdraw_data~load_asset_id();
+    slice recipient_address_of_withdraw = withdraw_data~load_msg_addr();
+
+    int include_user_code = general_data~load_bool_ext(); ;; bool
+    cell requested_ref_tokens = general_data~load_dict();
+    int ton_amount_for_repay_remainings = general_data~load_amount();
+    cell custom_response_payload = general_data~load_ref();
+    int subaccount_id = 0;
+    int return_repay_remainings_flag = false;
+    int custom_payload_saturation_flag = false;
+    if(general_data.slice_bits() == (16 + 2 + 2)) {
+        subaccount_id = general_data~load_int(16);
+        return_repay_remainings_flag = general_data~load_bool_ext();
+        custom_payload_saturation_flag = general_data~load_bool_ext();
+    }
+
+    in_msg_body.end_parse();
+    supply_data.end_parse();
+    withdraw_data.end_parse();
+    general_data.end_parse();
+
+    return (
+        supply_amount, withdraw_amount, withdraw_asset_id, recipient_address_of_withdraw, include_user_code, requested_ref_tokens,
+        ton_amount_for_repay_remainings, custom_response_payload, subaccount_id, return_repay_remainings_flag, custom_payload_saturation_flag
+    );
+}
+
+(cell) pack_supply_withdraw_user_message(
+    int query_id,
+    int supply_amount, int supply_asset_id,
+    int withdraw_amount, int withdraw_asset_id, slice recipient_address_of_withdraw, cell prices_packed,
+    cell asset_config_collection, cell asset_dynamics_collection,
+    int ton_amount_for_repay_remainings, cell custom_response_payload, int subaccount_id, int return_repay_remainings_flag, int custom_payload_saturation_flag
+) {
+    cell supply_data = begin_cell()
+                      .store_amount(supply_amount) ;; 64
+                      .store_asset_id(supply_asset_id) ;; 256
+                      .end_cell();
+
+    cell withdraw_data = begin_cell()
+                        .store_amount(withdraw_amount) ;; 64
+                        .store_asset_id(withdraw_asset_id) ;; 256
+                        .store_slice(recipient_address_of_withdraw) ;; 267
+                        .store_dict(prices_packed)
+                        .end_cell();
+
+    cell general_data = begin_cell()
+                       .store_dict(asset_config_collection) ;; ^1
+                       .store_dict(asset_dynamics_collection) ;; ^1
+				       .store_amount(ton_amount_for_repay_remainings) ;; 64
+				       .store_ref(custom_response_payload) ;; ^1
+                       .store_int(subaccount_id, 16)
+                       .store_int(return_repay_remainings_flag, 2) ;; 2
+                       .store_int(custom_payload_saturation_flag, 2) ;; 2
+                       .end_cell();
+
+    cell msg_body = begin_cell()
+                   .store_op_code(op::supply_withdraw_user) ;; 32
+                   .store_query_id(query_id) ;; 64
+                   .store_ref(supply_data) ;; ^1
+                   .store_ref(withdraw_data) ;; ^1
+                   .store_ref(general_data) ;; ^1
+                   .end_cell();
+
+    return msg_body;
+}
+
+(int, int, int, int, slice, cell, cell, cell, int, cell, int, int, int) parse_supply_withdraw_user_message(slice in_msg_body) {
+    slice supply_data = in_msg_body~load_ref().begin_parse();
+    slice withdraw_data = in_msg_body~load_ref().begin_parse();
+    slice general_data = in_msg_body~load_ref().begin_parse();
+
+    int supply_amount = supply_data~load_amount();
+    int supply_asset_id = supply_data~load_asset_id();
+    
+    int withdraw_amount = withdraw_data~load_amount();
+    int withdraw_asset_id = withdraw_data~load_asset_id();
+    slice recipient_address_of_withdraw = withdraw_data~load_msg_addr(); ;; recipient address of supply must be equal to sender address, otherwise the algorithm breaks
+    cell prices_with_signature_packed = withdraw_data~load_dict();
+
+    cell asset_config_collection = general_data~load_dict();
+    cell asset_dynamics_collection = general_data~load_dict();
+    int ton_amount_for_repay_remainings = general_data~load_amount();
+    cell custom_response_payload = general_data~load_ref();
+    int subaccount_id = general_data~load_int(16);
+    int return_repay_remainings_flag = general_data~load_bool_ext();
+    int custom_payload_saturation_flag = general_data~load_bool_ext();
+
+    in_msg_body.end_parse();
+    supply_data.end_parse();
+    withdraw_data.end_parse();
+    general_data.end_parse();
+
+    return (
+        supply_amount, supply_asset_id,
+        withdraw_amount, withdraw_asset_id, recipient_address_of_withdraw, prices_with_signature_packed,
+        asset_config_collection, asset_dynamics_collection, ton_amount_for_repay_remainings, custom_response_payload, subaccount_id, return_repay_remainings_flag, custom_payload_saturation_flag
+    );
+}
+
+(cell) pack_supply_withdraw_satisfied_message(
+    int query_id, slice owner_address,
+    int supply_asset_id, int supply_amount, int supply_new_principal, int repay_amount_principal, int supply_amount_principal,
+    int withdraw_asset_id, int withdraw_amount, slice recipient_address_of_withdraw, int withdraw_new_principal, int borrow_amount_principal, int reclaim_amount_principal, 
+    int ton_amount_for_repay_remainings, cell custom_response_payload, int subaccount_id, int return_repay_remainings_flag, int custom_payload_saturation_flag
+) {
+    cell supply_data = begin_cell()
+                      .store_slice(owner_address)
+                      .store_amount(supply_amount) ;; 64
+                      .store_asset_id(supply_asset_id) ;; 256
+                      .store_principal(supply_new_principal) ;; 64
+                      .store_principal(repay_amount_principal) ;; 64
+                      .store_principal(supply_amount_principal) ;; 64
+                      .end_cell();
+
+    cell withdraw_data = begin_cell()
+                        .store_amount(withdraw_amount) ;; 64
+                        .store_asset_id(withdraw_asset_id) ;; 256
+                        .store_slice(recipient_address_of_withdraw) ;; 267
+                        .store_principal(withdraw_new_principal) ;; 64
+                        .store_principal(borrow_amount_principal) ;; 64
+                        .store_principal(reclaim_amount_principal) ;; 64
+                        .end_cell();
+
+    cell general_data = begin_cell()
+				       .store_amount(ton_amount_for_repay_remainings) ;; 64
+				       .store_ref(custom_response_payload) ;; ^1
+                       .store_int(subaccount_id, 16) ;; 16
+                       .store_int(return_repay_remainings_flag, 2) ;; 2
+                       .store_int(custom_payload_saturation_flag, 2) ;; 2
+                       .end_cell();
+
+    cell msg_body = begin_cell()
+                   .store_op_code(op::supply_withdraw_satisfied) ;; 32
+                   .store_query_id(query_id) ;; 64
+                   .store_ref(supply_data) ;; ^1
+                   .store_ref(withdraw_data) ;; ^1
+                   .store_ref(general_data) ;; ^1
+                   .end_cell();
+
+    return msg_body;
+}
+
+(slice, int, int, int, int, int, int, int, slice, int, int, int, int, cell, int, int, int) parse_supply_withdraw_satisfied_message(slice in_msg_body) {
+    slice supply_data = in_msg_body~load_ref().begin_parse();
+    slice withdraw_data = in_msg_body~load_ref().begin_parse();
+    slice general_data = in_msg_body~load_ref().begin_parse();
+    
+    slice owner_address = supply_data~load_msg_addr();
+    int supply_amount = supply_data~load_amount();
+    int supply_asset_id = supply_data~load_asset_id();
+    int supply_new_principal = supply_data~load_principal();
+    int repay_amount_principal = supply_data~load_principal();
+    int supply_amount_principal = supply_data~load_principal();
+    
+    int withdraw_amount = withdraw_data~load_amount();
+    int withdraw_asset_id = withdraw_data~load_asset_id();
+    slice recipient_address_of_withdraw = withdraw_data~load_msg_addr(); ;; recipient address of supply must be equal to sender address, otherwise the algorithm breaks
+    int withdraw_new_principal = withdraw_data~load_principal();
+    int borrow_amount_principal = withdraw_data~load_principal();
+    int reclaim_amount_principal = withdraw_data~load_principal();
+
+    int ton_amount_for_repay_remainings = general_data~load_amount();
+    cell custom_response_payload = general_data~load_ref();
+    int subaccount_id = general_data~load_int(16);
+    int return_repay_remainings_flag = general_data~load_bool_ext();
+    int custom_payload_saturation_flag = general_data~load_bool_ext();
+
+    in_msg_body.end_parse();
+    supply_data.end_parse();
+    withdraw_data.end_parse();
+    general_data.end_parse();
+
+    return (
+        owner_address, supply_amount, supply_asset_id, supply_new_principal, repay_amount_principal, supply_amount_principal,
+        withdraw_amount, withdraw_asset_id, recipient_address_of_withdraw, withdraw_new_principal, borrow_amount_principal, reclaim_amount_principal,
+        ton_amount_for_repay_remainings, custom_response_payload, subaccount_id, return_repay_remainings_flag, custom_payload_saturation_flag
+    );
+}
+
+(cell) pack_supply_withdraw_unsatisfied_message(
+    int query_id, slice owner_address,
+    int supply_asset_id, int supply_amount,
+    int ton_amount_for_repay_remainings, cell custom_response_payload, int subaccount_id
+) {
+    cell supply_data = begin_cell()
+                      .store_slice(owner_address)
+                      .store_amount(supply_amount) ;; 64
+                      .store_asset_id(supply_asset_id) ;; 256
+                      .end_cell();
+
+    cell withdraw_data = begin_cell()
+                        .end_cell();
+
+    cell general_data = begin_cell()
+				       .store_amount(ton_amount_for_repay_remainings) ;; 64
+				       .store_ref(custom_response_payload) ;; ^1
+                       .store_int(subaccount_id, 16) ;; 16
+                       .end_cell();
+
+    cell msg_body = begin_cell()
+                   .store_op_code(op::supply_withdraw_unsatisfied) ;; 32
+                   .store_query_id(query_id) ;; 64
+                   .store_ref(supply_data) ;; ^1
+                   .store_ref(withdraw_data) ;; ^1
+                   .store_ref(general_data) ;; ^1
+                   .end_cell();
+
+    return msg_body;
+}
+
+(slice, int, int, int, cell, int) parse_supply_withdraw_unsatisfied_message(slice in_msg_body) {
+    slice supply_data = in_msg_body~load_ref().begin_parse();
+    slice withdraw_data = in_msg_body~load_ref().begin_parse();
+    slice general_data = in_msg_body~load_ref().begin_parse();
+    
+    slice owner_address = supply_data~load_msg_addr();
+    int supply_amount = supply_data~load_amount();
+    int supply_asset_id = supply_data~load_asset_id();
+
+    int ton_amount_for_repay_remainings = general_data~load_amount();
+    cell custom_response_payload = general_data~load_ref();
+    int subaccount_id = general_data~load_int(16);
+
+    in_msg_body.end_parse();
+    supply_data.end_parse();
+    withdraw_data.end_parse();
+    general_data.end_parse();
+
+    return (
+        owner_address, supply_amount, supply_asset_id,
+        ton_amount_for_repay_remainings, custom_response_payload, subaccount_id
+    );
+}
+
+(builder) pack_supply_withdraw_fail_message(
+    int query_id,
+    int supply_asset_id, int supply_principal_amount,
+    int withdraw_asset_id, int withdraw_principal_amount,
+    int subaccount_id
+) {
+    cell supply_data = begin_cell()
+                      .store_asset_id(supply_asset_id) ;; 256
+                      .store_amount(supply_principal_amount) ;; 64
+                      .end_cell();
+
+    cell withdraw_data = begin_cell()
+                        .store_asset_id(withdraw_asset_id) ;; 256
+                        .store_amount(withdraw_principal_amount) ;; 64
+                        .end_cell();
+
+    cell general_data = begin_cell()
+                       .store_int(subaccount_id, 16) ;; 16
+                       .end_cell();
+
+    builder msg_body = begin_cell()
+                   .store_op_code(op::supply_withdraw_fail) ;; 32
+                   .store_query_id(query_id) ;; 64
+                   .store_ref(supply_data) ;; ^1
+                   .store_ref(withdraw_data) ;; ^1
+                   .store_ref(general_data); ;; ^1
+
+    return msg_body;
+}
+
+(int, int, int, int, int) parse_supply_withdraw_fail_message(slice in_msg_body) {
+    slice supply_data = in_msg_body~load_ref().begin_parse();
+    slice withdraw_data = in_msg_body~load_ref().begin_parse();
+    slice general_data = in_msg_body~load_ref().begin_parse();
+
+    int supply_asset_id = supply_data~load_asset_id();
+    int supply_principal_amount = supply_data~load_principal();
+
+    int withdraw_asset_id = withdraw_data~load_asset_id();
+    int withdraw_principal_amount = withdraw_data~load_principal();
+    
+    int subaccount_id = general_data~load_int(16);
+
+    in_msg_body.end_parse();
+    supply_data.end_parse();
+    withdraw_data.end_parse();
+    general_data.end_parse();
+
+    return (
+        supply_asset_id, supply_principal_amount, 
+        withdraw_asset_id, withdraw_principal_amount,
+        subaccount_id
+    );
+}
+
+(builder) pack_supply_withdraw_success_message(
+    int query_id,
+    int supply_asset_id, int supply_principal_amount,
+    int withdraw_asset_id, int withdraw_principal_amount,
+    cell asset_config_collection, cell asset_dynamics_collection, int subaccount_id
+) {
+    cell supply_data = begin_cell()
+                      .store_asset_id(supply_asset_id) ;; 256
+                      .store_amount(supply_principal_amount) ;; 64
+                      .end_cell();
+
+    cell withdraw_data = begin_cell()
+                        .store_asset_id(withdraw_asset_id) ;; 256
+                        .store_amount(withdraw_principal_amount) ;; 64
+                        .end_cell();
+
+    cell general_data = begin_cell()
+                       .store_dict(asset_config_collection) ;; ^1
+                       .store_dict(asset_dynamics_collection) ;; ^1
+                       .store_int(subaccount_id, 16) ;; 16
+                       .end_cell();
+
+    builder msg_body = begin_cell()
+                    .store_op_code(op::supply_withdraw_success)
+                    .store_query_id(query_id)
+                    .store_ref(supply_data) ;; ^1
+                    .store_ref(withdraw_data) ;; ^1
+                    .store_ref(general_data); ;; ^1
+
+    return msg_body;
+}
+
+(int, int, int, int, cell, cell, int) parse_supply_withdraw_success_message(slice in_msg_body) {
+    slice supply_data = in_msg_body~load_ref().begin_parse();
+    slice withdraw_data = in_msg_body~load_ref().begin_parse();
+    slice general_data = in_msg_body~load_ref().begin_parse();
+
+    int supply_asset_id = supply_data~load_asset_id();
+    int supply_principal_amount = supply_data~load_amount();
+
+    int withdraw_asset_id = withdraw_data~load_asset_id();
+    int withdraw_principal_amount = withdraw_data~load_amount();
+    
+    cell asset_config_collection = general_data~load_dict();
+    cell asset_dynamics_collection = general_data~load_dict();
+    int subaccount_id = general_data~load_int(16);
+
+    in_msg_body.end_parse();
+    supply_data.end_parse();
+    withdraw_data.end_parse();
+    general_data.end_parse();
+
+    return (
+        supply_asset_id, supply_principal_amount, 
+        withdraw_asset_id, withdraw_principal_amount, 
+        asset_config_collection, asset_dynamics_collection, subaccount_id
+    );
+}
+
+;; --------------- op::supply_withdraw_excess ---------------
+;; supply_withdraw excess message - refund extra TON attachment back to owner
+(cell) pack_supply_withdraw_excess_message(int op_code, int query_id) {
+    return begin_cell()
+		.store_op_code(op_code)
+		.store_query_id(query_id)
+		.end_cell();
+}
+
+(cell) pack_supply_withdraw_excess_message_with_data(int op_code, int query_id, cell custom_response_payload) {
+    return begin_cell()
+		.store_op_code(op_code)
+		.store_query_id(query_id)
+		.store_ref(custom_response_payload)
+		.end_cell();
+}
+
+cell pack_supply_withdraw_satisfied_and_repay_remainings_message(int query_id) {
+    return begin_cell()
+		.store_op_code(op::supply_withdraw_satisfied_and_repay_remainings)
+		.store_query_id(query_id)
+		.end_cell();
+}

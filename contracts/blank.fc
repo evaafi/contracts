@@ -1,16 +1,31 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "external/stdlib.fc";
-#include "external/ton.fc";
 
 ;; should not be changed
 #include "constants/op-codes.fc";
 #include "constants/errors.fc";
-#include "data/basic-types.fc";
+
+;; builder store_op_code(builder b, int op_code) inline { return b.store_uint(op_code, 32); }
+;; (slice, int) load_bool_ext(slice cs) inline { return cs.load_int(2); }
+
+(int) get_current_workchain () method_id(7) {
+    var (wc, _) = parse_std_addr(my_address());
+    return (wc);
+}
+
+(slice, (int, cell, int)) __load_header_asm_impl(slice cs) asm """
+    LDGRAMS     // int user_version = cs~load_coins();
+    LDOPTREF    // cell upgrade_info = cs~load_maybe_ref();
+    2 LDI       // int upgrade_exec = cs~load_bool_ext();
+    3 1 BLKSWAP // return (cs, (user_version, upgrade_info, upgrade_exec) );
+""";
+;; equivalent to "x{FA00F404D2015520} @addop";
+;; For some reason new compiler version optimizes code WORSE than the old one (uses XCHG3)
+;; And even does stupid things like 01 01 (SWAP SWAP)!
 
 ;; copypasted this code from /messages/upgrade-header.fc to prevent changes on blank fc code
-(slice, (int, cell, int)) user::upgrade::load_header(slice cs) {
+(slice, (int, cell, int)) user::upgrade::load_header(slice cs) method_id(17) {
+    return __load_header_asm_impl(cs);
+    {-
 	int user_version = cs~load_coins();
 	cell upgrade_info = cs~load_maybe_ref();
 	int upgrade_exec = cs~load_bool_ext();
@@ -19,6 +34,7 @@
 		(user_version, upgrade_info,
 		upgrade_exec)
 	);
+	-}
 }
 
 ;; copypasted this code from /locig/tx-utils.fc to prevent changes on blank fc code
@@ -26,7 +42,7 @@
 () send_message(
 	slice to_address, int nano_ton_amount,
 	cell content, int mode
-) impure {
+) impure method_id(12) {
 	var msg = begin_cell()
 		.store_uint(0x10, 6) 
 		;; ??? Sends non-bounceable. Does it need to be a parameter?
@@ -44,6 +60,23 @@
     return in_msg_body;
 }
 
+;; 0  NC RT STSL EC.NC PSHI SW STU  PSHI 99...99 SW STU  <-- Expected code version
+;; 70 C8 58 CF16 C9 C8 800F 01 CB1F 821005F5E0FF 01 CB3F 5003CF1612CCC98040F00CF80F8200C4F4F2F0
+;; (inner cell bld).PSHI 99...99 NC PSHI SW STU  STU    <-- Compiled code version
+;; 70 C8 58 CF16 C9 821005F5E0FF C8 800F 01 CB1F CB3F    5003CF1612CCC98040F00CF80F8200C4F4F2F0
+;; The difference is^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ - the new compiler optimizes that better
+;; We need to force that part to be in specific old order to match previous bytecode:
+(builder) __begin_cell_with_op_code_and_query_id() asm """
+    NEWC // begin_cell()
+    15 PUSHINT // |   ( op::revert_call = 0xF = 15 )
+    SWAP       // |-> .store_op_code(op::revert_call)
+    32 STU     // |   ( = .store_uint(op_code, 32) )
+    99999999 PUSHINT // |
+    SWAP             // |-> .store_query_id(99999999)
+    64 STU           // |
+""";
+;; equivalent to "x{C8800F01CB1F821005F5E0FF01CB3F} @addop";
+
 () revert_call(
     slice sender_address, slice owner_address,
     slice in_msg_body
@@ -51,9 +84,12 @@
   send_message(
     sender_address,
     0,
+    {-
     begin_cell()
     .store_op_code(op::revert_call) ;; 32
     .store_query_id(99999999) ;; 64
+    -}
+    __begin_cell_with_op_code_and_query_id()
     .store_slice(owner_address) ;; 3+8+256
     ;; Part above is totalling: 32 + 64 + 3+8+256 = 363 bits,
     ;; which is significant -> Let's keep in_msg_body in a separate cell
@@ -67,15 +103,6 @@
   throw(error::user_code_version_mismatch);
 }
 
-
-;; I don't even know if we need to have sender_address as a parameter,
-;; because Blank/User only accepts messages from master_address,
-;; so sender_address == master_address (which is available through storage)
-;; and it will stay this way at the very least on Blank.
-;; It is theoretically possible to loosen this requirement in the future:
-;; only requiring the first request to User to be sent from Master
-;; (which would upgrade User contract to accept not just Master's messages),
-;; but I don't immediately see a decent use-case for it
 () handle_transaction(
     slice sender_address, slice in_msg_body_original,
     int my_balance, int msg_value, cell in_msg_full, slice in_msg_body

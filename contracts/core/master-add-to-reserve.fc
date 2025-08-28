@@ -1,0 +1,78 @@
+#include "../constants/constants.fc";
+#include "../constants/errors.fc";
+
+() add_to_reserve_jetton_process (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor, ;; storage params
+  int jetton_op_code, int query_id, int jetton_amount, slice initial_sender, int user_version, cell user_code ;; jetton tx body params
+) impure inline {
+  (slice token_id, int found) = tokens_keys.udict_get?(256, addr_hash);
+
+  int asset_id = token_id~load_asset_id();
+
+  (
+    int s_rate, int b_rate,
+    int total_supply_principal, int total_borrow_principal,
+    int last_accrual, int token_balance,
+    int tracking_supply_index, int tracking_borrow_index,
+    int awaited_supply
+  ) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(asset_id);
+
+  asset_dynamics_collection~asset_dynamics_collection:set_packed(
+    asset_id,
+    s_rate, b_rate,
+    total_supply_principal, total_borrow_principal,
+    last_accrual, token_balance + jetton_amount,
+    tracking_supply_index, tracking_borrow_index,
+    awaited_supply
+  );
+
+  master::storage::save(
+    meta, upgrade_config,
+    asset_config_collection, 
+    if_active, oracles_info, admin, tokens_keys,
+    asset_dynamics_collection, supervisor
+  );
+  return ();
+}
+
+
+() add_to_reserve_process (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor, ;; storage params
+  int op, int query_id ;; trx body
+) impure inline {
+  (_, int is_ton_supported) = asset_config_collection.udict_get?(256, constants::ton_asset_id);
+  throw_if(error::ton_unsupported, ~ is_ton_supported);
+
+  int add_to_reserve_amount_final = msg_value - fee::incoming_asset;
+
+  throw_if(error::add_to_reserve_not_enough_fees, add_to_reserve_amount_final <= 0);
+
+  (
+    int s_rate, int b_rate,
+    int total_supply_principal, int total_borrow_principal,
+    int last_accrual, int token_balance,
+    int tracking_supply_index, int tracking_borrow_index,
+    int awaited_supply
+  ) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(constants::ton_asset_id);
+
+  asset_dynamics_collection~asset_dynamics_collection:set_packed(
+    constants::ton_asset_id,
+    s_rate, b_rate,
+    total_supply_principal, total_borrow_principal,
+    last_accrual, token_balance + add_to_reserve_amount_final,
+    tracking_supply_index, tracking_borrow_index,
+    awaited_supply
+  );
+
+  master::storage::save(
+    meta, upgrade_config,
+    asset_config_collection, 
+    if_active, oracles_info, admin, tokens_keys,
+    asset_dynamics_collection, supervisor
+  );
+  return ();
+}

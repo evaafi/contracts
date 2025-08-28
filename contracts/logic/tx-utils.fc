@@ -1,6 +1,3 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "../external/ton.fc";
 #include "../external/stdlib.fc";
 #include "../constants/constants.fc";
@@ -19,8 +16,7 @@ const int jetton_op::excesses = 0xd53276db;
 	cell content, int mode
 ) impure {
 	var msg = begin_cell()
-		.store_uint(0x10, 6) ;; todo: !!!! Any way to reasonably process bounced messages
-		;; ??? Sends non-bounceable. Does it need to be a parameter?
+		.store_uint(0x10, 6) 
 		.store_slice(to_address)
 		.store_grams(nano_ton_amount)
 		.store_uint(0, 1 + 4 + 4 + 64 + 32 + 1)
@@ -38,6 +34,30 @@ const int jetton_op::excesses = 0xd53276db;
 	send_message(
 		my_jetton_wallet_address,
 		0, ;; because we using mode 128 +raw_reserve everywhere we dont need ton amount here
+		begin_cell()
+		.store_op_code(jetton_op::transfer)
+		.store_query_id(query_id)
+		.store_grams(amount) ;; jetton amount
+		.store_slice(to_address) ;; new owner
+		.store_slice(to_address) ;; response_destination -> refund excess fees to the owner
+		.store_maybe_ref(body) ;; custom_response_payload
+		.store_grams(nano_ton_attachment) ;; minimum nano-TON amount to send transfer_notification
+		;;.store_bool(false) ;; forward_payload
+		.store_maybe_ref(body) ;; custom_response_payload
+		.end_cell(),
+		mode ;; send mode
+	);
+}
+
+() send_jetton_with_specified_fee(
+	slice my_jetton_wallet_address,
+	slice to_address,
+	int query_id, int amount, int ton_amount,
+	int nano_ton_attachment, cell body, int mode
+) impure {
+	send_message(
+		my_jetton_wallet_address,
+		ton_amount, ;; because we using mode 128 +raw_reserve everywhere we dont need ton amount here
 		begin_cell()
 		.store_op_code(jetton_op::transfer)
 		.store_query_id(query_id)
@@ -86,14 +106,14 @@ const int jetton_op::excesses = 0xd53276db;
 	send_message(to_address, 0, content, sendmode::CARRY_ALL_BALANCE + 2);
 }
 
-() send_message_to_lending_wallet_by_address(
+() send_message_to_evaa_user_sc_by_address(
   cell state_init, int ton_amount, int user_version, cell upgrade_info,
-  slice lending_wallet_address, builder content,
+  slice evaa_user_sc_address, builder content,
   int message_send_mode
 ) impure {
   builder msg = begin_cell()
                 .store_uint(0x10, 6) ;; Non-bounceable to be able to deploy
-                .store_slice(lending_wallet_address)
+                .store_slice(evaa_user_sc_address)
                 .store_grams(ton_amount)
                 .store_uint(0, 1 + 4 + 4 + 64 + 32);
 
@@ -107,33 +127,29 @@ const int jetton_op::excesses = 0xd53276db;
     begin_cell()
       .user::upgrade::store_header(user_version, upgrade_info, true)
       .store_builder(content)
-      ;; ^ NOTE: !!! Consider changing upgrade format so that "content" is completely independent from the header. At the moment, upgrade header uses 1 reference out of available 4 to be stored in the cell. So whoever constructs "content" needs keep that in mind and use no more than 3 references. In the future, in case upgrade header starts using 2 references, some of the previous code for "content" (which thought 3 references are ok) would be broken
       .end_cell()
   );
 
   send_raw_message(msg.end_cell(), message_send_mode);
 }
 
-;; ??? Do we need send-mode as a separate parameter?
-() send_message_to_lending_wallet( ;; note rename landing_wallet to user sc
+() send_message_to_evaa_user_sc( 
   cell blank_code, int user_version, cell user_code,
   slice owner_address, cell content,
-  int message_send_mode
+  int message_send_mode, int subaccount_id
 ) impure {
-  cell state_init = calculate_user_state_init(blank_code, owner_address);
-  slice lending_wallet_address = calculate_address(state_init);
+  cell state_init = calculate_user_state_init(blank_code, owner_address, subaccount_id);
+  slice evaa_user_sc_address = calculate_address(state_init);
 
 	cell upgrade_info = null();
 	ifnot (user_code.null?()) {
-		;; NOTE: !! Gas optimization
-		;; Code rearranged to do not call the following line when not needed!
 		cell user_data = calculate_user_init_data(user_version, owner_address);
 		upgrade_info = begin_cell().store_ref(user_code).store_ref(user_data).end_cell();
 	}
 
-  send_message_to_lending_wallet_by_address(
+  send_message_to_evaa_user_sc_by_address(
     state_init, 0, user_version, upgrade_info,
-    lending_wallet_address, begin_cell().store_slice(content.begin_parse()),
+    evaa_user_sc_address, begin_cell().store_slice(content.begin_parse()),
     message_send_mode
   );
 }
@@ -143,20 +159,16 @@ const int jetton_op::excesses = 0xd53276db;
 	int query_id, int addr_hash, int amount,
 	int nano_ton_attachment, cell body, int mode
 ) impure {
-	;; todo: !! Consider sending asset with raw_reserve and mode=128
-	;; such that the exact network fee remainders are refunded
-	;; In this case also update the tests to require exact equality
 	if (addr_hash == constants::ton_asset_id) {
 		send_message(
-			to_address, amount + nano_ton_attachment,
+			to_address, amount , ;; + nano_ton_attachment ? do we need it here? if its CARRY_ALL_REMAINING_MESSAGE_VALUE ? do we need it if its raw reserve?
 			body,
 			mode ;; send mode
 		);
 	} else {
 		send_jetton(
 			calc_address_from_hash(addr_hash), 
-			to_address, ;; new owner, and also:
-			;; response_destination -> refund excess fees to the owner
+			to_address,
 			query_id, amount, ;; jetton amount
 			nano_ton_attachment, 
 			body, ;; custom_response_payload
@@ -165,21 +177,30 @@ const int jetton_op::excesses = 0xd53276db;
 	}
 }
 
-() send_asset(
+() send_asset_ext_with_specified_fee(
 	slice to_address,
-	int query_id, int addr_hash, int amount,
-	int nano_ton_attachment
+	int query_id, int addr_hash, int amount, int ton_amount,
+	int nano_ton_attachment, cell body, int mode
 ) impure {
-	send_asset_ext(
-		to_address,
-		query_id, addr_hash, amount,
-		nano_ton_attachment,
-		begin_cell().end_cell(), ;; todo: send some proper comment, with query_id?
-		sendmode::REGULAR
-	);
+	if (addr_hash == constants::ton_asset_id) {
+		send_message(
+			to_address, amount + ton_amount,
+			body,
+			mode ;; send mode
+		);
+	} else {
+		send_jetton_with_specified_fee(
+			calc_address_from_hash(addr_hash), 
+			to_address,
+			query_id, amount, ;; jetton amount
+			ton_amount,
+			nano_ton_attachment, 
+			body, ;; custom_response_payload
+			mode
+		);
+	}
 }
 
-;; Used to refund asset in THE SAME transaction as it arrived thus being able to use mode=64 and refund exact remains
 () immediate_asset_refund(
 	slice to_address,
 	int query_id, int asset_id, int amount,

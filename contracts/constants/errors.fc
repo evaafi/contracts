@@ -1,6 +1,3 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 ;; I tried to separate error codes into two parts:
 ;; Left: WHERE
 ;; Right: WHAT
@@ -8,10 +5,13 @@
 
 ;; ----- Transaction fees -----
 ;; E = fEEs
+
+const int error::add_to_reserve_not_enough_fees       = 0xA9E9;
 const int error::claim_asset_reserves_transaction_fees = 0xA2E9;
 const int error::incoming_asset_transaction_fees       = 0x10E9;
-const int error::withdraw_master_transaction_fees      = 0x20E9;
 const int error::liquidate_asset_transaction_fees      = 0x30E9;
+const int error::pyth_feeds_update_transaction_fees    = 0x40E9;
+const int error::supply_withdraw_master_transaction_fees      = 0x50E9;
 
 ;; ----- Supply -----
 ;; ----- Withdraw -----
@@ -20,14 +20,14 @@ const int error::liquidate_asset_transaction_fees      = 0x30E9;
 
 const int error::master_liquidating_too_much  = 0x30F1;
 const int error::not_liquidatable             = 0x31F2;
-const int error::min_collateral_not_satisfied = 0x31F3; ;; NOTE: !!! I don't like this name: because of soft-checks, there are various reasons min_collateral might not be satisfied. Rename to "low_reward" or something similar
+const int error::min_collateral_not_satisfied = 0x31F3;
 const int error::user_not_enough_collateral   = 0x31F4;
 const int error::user_liquidating_too_much    = 0x31F5;
 const int error::master_not_enough_liquidity  = 0x31F6;
 
 const int error::liquidation_prices_missing   = 0x31F7;
 
-const int error::liqudation_execution_crashed = 0x31FE;
+const int error::liquidation_execution_crashed = 0x31FE;
 
 ;; ----- Jettons -----
 
@@ -46,15 +46,13 @@ const int error::claim_asset_reserves_too_much   = 0xA2F9;
 const int error::message_not_from_admin              = 0x00FA;
 const int error::message_not_from_master             = 0x01FB;
 const int error::different_workchain          = 0x55FF;
-
-const int error::idle_target_not_allowed             = 0x60FC;
-
 const int error::supply_success_fake_sender          = 0x1aFC;
 const int error::supply_fail_fake_sender             = 0x1fFC;
-const int error::withdraw_collateralized_fake_sender = 0x21FC;
 const int error::liquidate_unsatisfied_fake_sender   = 0x3fFC;
 const int error::liquidate_satisfied_fake_sender     = 0x31FC;
 const int error::revert_fake_sender                  = 0xF0FC;
+const int error::supply_withdraw_unsatisfied_fake_sender = 0x4fFC;
+const int error::supply_withdraw_satisfied_fake_sender = 0x41FC;
 
 ;; ----- Upgrade -----
 
@@ -67,50 +65,46 @@ const int error::user_code_version_mismatch = 0xC4F4;
 const int error::broken_upgrade_info        = 0xC4F2;
 const int error::unexpected_empty_value     = 0xC4F0;
 const int error::user_data_changed           = 0xC4F1;
-const int error::user_code_broken            = 0xC4F3;
-const int error::user_code_broken_on_upgrade             = 0xC4F5;
-const int error::user_code_broken_on_transaction      = 0xC4F6;
-;; ^ Come up with better/shorter names for these ^
 
 ;; ----- Prices -----
 
-const int error::prices_incorrect_signature = 0x50Fa;
-const int error::prices_incorrect_timestamp = 0x50Fe;
-
-const int error::prices_incorrect_sequence        = 0x50F0;
-const int error::prices_incorrect_proof           = 0x50F1;
-const int error::prices_no_such_oracle            = 0x50F2;
-const int error::prices_not_enough_data           = 0x50F3;
-const int error::prices_incorrect_suggested_price = 0x50F4;
-const int error::prices_too_much_data             = 0x50F5;
+const int error::prices_incorrect_timestamp       = 0x50Fe;
 const int error::prices_not_positive              = 0x50F6;
+const int error::ref_token_not_allowed            = 0x50F7;
+const int error::ref_token_no_referred_value      = 0x50F8;
 
 ;; ----- Locked -----
 
 const int error::disabled                  = 0x70F0;
 
-const int error::user_is_locked            = 0x51F0;
 const int error::user_withdraw_in_progress = 0x31F0;
 
 ;; ----- Bounces -----
 
-const int error::bounced_on_master = 0x61FF;
 const int error::bounced_on_blank  = 0x60FF;
-const int error::bounced_on_user   = 0x62FF;
 
 
 ;; ----- Others -----
 
 const int error::invalid_address_provided = 0x80FA; ;; A - address
 const int error::custom_response_payload_too_big   = 0x80FB; ;; B - big
-const int error::cant_revert_upgrade_exec = 0x80FC;
 const int error::already_exists           = 0x80FE;
 const int error::we_screwed_up_revert     = 0x80FF;
 
 const int error::around_zero_split_messed_up = 0x80F1;
 const int error::already_inited = 0x80F2;
-const int error::cant_update_dynamics_not_freezed = 0x80F3;
 
-const int error::invalid_data             = 0x8DF0;
+const int error::invalid_data             = 0x8D00;
+const int error::ton_unsupported             = 0x101;
 
 const int error::sys::integer_out_of_expected_range = 5;
+
+;; ----- Pyth related -----
+
+const int error::pyth_not_authorized                                 = 0x90F0;
+const int error::unsupported_feeds_operation                         = 0x90F1;
+const int error::unsupported_master_pyth_operation                   = 0x90F2;
+const int error::unexpected_operation_in_pyth_error_response         = 0x90F3;
+const int error::pyth_error_on_liquidate                             = 0x90F4;
+const int error::onchain_getter_invalid_sender                       = 0x90F5;
+const int error::pyth_error_on_supply_withdraw                       = 0x90F6;

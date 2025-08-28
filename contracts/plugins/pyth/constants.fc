@@ -1,0 +1,2 @@
+;; evaa related
+const int evaa::price_scale = 1000000000;

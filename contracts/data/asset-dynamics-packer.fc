@@ -1,6 +1,3 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "../constants/errors.fc";
 #include "../external/stdlib.fc";
 #include "basic-types.fc";
@@ -35,19 +32,6 @@ cell pack_asset_dynamics(
 	
 	int total_supply_principal = asset_dynamics~load_principal();
 	int total_borrow_principal = asset_dynamics~load_principal();
-	;; we dont need load_int here
-	;; nns2009: ... yes, but:
-	;; 1) "unpack" has to mirror "pack" to avoid future surprises
-	;; 2) All principals across the project are stored consistently to avoid confusion
-	;; 3) In a theoretical case there is a "de-sync" (total_*_principal doesn't match the sum of all Users' principals), it's preferrable that:
-	;; - total_*_principal becomes negative
-	;; - utilization becomes negative
-	;; - supply_interest and borrow_interest become of different signs
-	;;   => So interest accumulation works incorrectly,
-	;; + But *slowly* and *gradually* incorrectly accumulating percentages,
-	;;   instead of the protocol stopping entirely
-	;;   with inability to even Withdraw/Reclaim your own assets
-	
 	int last_accrual = asset_dynamics~load_timestamp();
 	int token_balance = asset_dynamics~load_balance();
 	int tracking_supply_index = asset_dynamics~load_tracking_index();

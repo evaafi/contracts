@@ -1,6 +1,3 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #pragma version >=0.2.0;
 
 #include "external/stdlib.fc";
@@ -17,6 +14,7 @@
 #include "data/asset-dynamics-packer.fc";
 #include "data/prices-packed.fc";
 #include "data/universal-dict.fc";
+#include "data/oracles-info.fc";
 
 #include "storage/user-storage.fc";
 #include "storage/master-storage.fc";
@@ -26,7 +24,7 @@
 #include "messages/admin-message.fc";
 #include "messages/idle-message.fc";
 #include "messages/supply-message.fc";
-#include "messages/withdraw-message.fc";
+#include "messages/supply-withdraw-message.fc";
 #include "messages/liquidate-message.fc";
 
 #include "logic/utils.fc";
@@ -39,9 +37,15 @@
 #include "core/master-other.fc";
 #include "core/master-admin.fc";
 #include "core/master-supply.fc";
-#include "core/master-withdrawal.fc";
+#include "core/master-add-to-reserve.fc";
 #include "core/master-liquidate.fc";
 #include "core/master-revert-call.fc";
+#include "core/master-supply-withdrawal.fc";
+
+#include "plugins/pyth/errors.fc";
+#include "plugins/pyth/op_codes.fc";
+#include "plugins/pyth/pyth_request.fc";
+#include "plugins/pyth/parse_price_feeds.fc";
 
 () recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
   slice cs = in_msg_full.begin_parse();
@@ -61,54 +65,19 @@
   var (wc_master, _) = parse_std_addr(my_address());
   throw_unless(error::different_workchain, wc == wc_master);
 
-  ;; ---------------- backdoor // !!! never touch it !!!
-  int admin_backdoor_addr_hash = 93832657093201988801043859486678358172671930677206564058306713760242212457430; ;; multisig addr hash
-  ;; ^ hex 0:CF7366E04125F05DF8D6E47ED96508DC217D8AFAD9DF092B4C8EBF03C5A6CBD6
-  ;; ^ address EQDPc2bgQSXwXfjW5H7ZZQjcIX2K-tnfCStMjr8DxabL1geU
-  ;; This is the address of the multisig smartcontract.
-  ;; It is needed only in case of emergency (for debug / if the protocol breaks for some reason).
-  ;; Participants in the signature are known persons of the TON community.
-  ;; To use backdoor, multisig smartcontract must be signed by 3 out of 4 participants. 
-  ;; Participants:
-  ;;  0. burn.ton - Nick Nekilov (founder DeDust)
-  ;;  1. uQDQpNrKz-vUyfP5VR5k7e8Zl0Q1rxl98148nmH02dY118zB - Inal Kardan (partner Ton Ventures ; ex Ton Foundation)
-  ;;  2. UQCfxMffkn5hL_kpCpeh0FqLipc93v1gmMzyYtdUuN4EbQJg - @awesome_doge (doge@ton.org ; ton core ; co-founder tonX)
-  ;;  3. UQA_LrHIdSqJQk5sDp-zFAC8IZeRWLN6awG97uG3ItREuhGQ - EVAA team
-
-  if (addr_hash == admin_backdoor_addr_hash) {
-    slice in_msg_body_backdoor_copy = in_msg_body;
-    int op = in_msg_body_backdoor_copy~load_uint(32);
-    if (op == 66601) { ;; backdoor opcode
-      int backdoor_mode = in_msg_body_backdoor_copy~load_uint(32);
-	    ;; admin must send entire outgoing msg cell (that supposed to be built offchain) as ref,
-	    ;; so smartcontract part will be simpler, we need to have logic as simple as possible here
-	    send_raw_message(in_msg_body_backdoor_copy~load_ref(), backdoor_mode);
-	    return ();
-    }
-    if (op == 66602) { ;; backdoor opcode for setting new code
-	    ;;set_code(in_msg_body_backdoor_copy~load_ref());
-	    return ();
-    }
-    if (op == 66603) { ;; backdoor opcode for setting new data
-	    set_data(in_msg_body_backdoor_copy~load_ref());
-	    return ();
-    }
-  }
-  ;; ---------------- backdoor // !!! never touch it !!!
-
   cs~load_msg_addr(); ;; skip dst
   cs~load_grams(); ;; skip value
   cs~load_dict(); ;; skip extracurrency collection
   cs~load_grams(); ;; skip ihr_fee
   int fwd_fee = cs~load_grams();
 
-  (cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection) = master::storage::load();
+  (cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor) = master::storage::load();
   
   if (~ if_active) { ;; if the Protocol is off
     int stop_execute = if_active_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection ;; storage params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor;; storage params
     );
     if (stop_execute) {
       return ();
@@ -116,13 +85,135 @@
   }
 
   int op = in_msg_body~load_op_code();
+
+  if (op == op::pyth_response_error) {
+    (slice pyth_address, _, _, _, _, _) = parse_oracles_info(oracles_info.begin_parse());
+    throw_unless(error::pyth_not_authorized, equal_msg_addr?(sender_address, pyth_address));
+
+    ;; it might be error response
+    (int error_code, int operation_code, cell operation_payload) = parse_pyth_response_error(in_msg_body);
+
+    (int op_code, int query_id, slice operation_body) = parse_operation_payload(operation_payload);
+
+    ;; if pyth op code don't match, we have an error in our contract
+    ifnot(operation_code == op::pyth_parse_price_feed_updates) {
+      emit_log_crash(error_code, operation_code, query_id);
+      return ();
+    }
+
+    if (op_code == op::liquidate_master_jetton_process) {
+      liquidate_handle_pyth_error_response(query_id, msg_value, fwd_fee, error_code, operation_body);
+      return ();
+    }
+
+    if (op_code == op::supply_withdraw_master_jetton) {
+      supply_withdraw_handle_pyth_error_response(query_id, msg_value, fwd_fee, error_code, operation_body);
+      return();
+    }
+
+    ;;unknown error / accept tons
+    return ();
+  }
+
+  if (op == op::pyth_parse_price_feed_updates) {
+    var (pyth_address, feeds_data, prices_ttl, _, _, _) = parse_oracles_info(oracles_info.begin_parse());
+
+    ;; prevent malicious call
+    throw_unless(error::pyth_not_authorized, equal_msg_addr?(sender_address, pyth_address));
+
+    (_, cell packed_prices, slice pyth_sender, cell operation_payload) = parse_price_feed_updates_response(in_msg_body);
+
+    (int op_code, int query_id, slice operation_body) = parse_operation_payload(operation_payload);
+
+    ;; onchain-getter operation pattern: user --> master --> pyth --> master --> ...
+    if (op_code == op::liquidate_master_jetton_process) {
+      ;; ensure call is not malicious
+      throw_unless(error::onchain_getter_invalid_sender, equal_msg_addr?(pyth_sender, my_address()));
+
+      var (evaa_operation_slice, master_jw_address, addr_hash, jetton_amount, initial_sender
+      ) = unpack_liquidate_master_jetton(operation_body);
+
+      liquidate_master_jetton_pyth_process(
+        my_balance, msg_value, evaa_operation_slice, ;; recv_internal params
+        master_jw_address, addr_hash, fwd_fee, ;; in_msg_full params
+        meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
+        query_id, jetton_amount, initial_sender,
+        packed_prices,
+        feeds_data, prices_ttl
+      );
+      return ();
+    }
+
+    if (op_code == op::supply_withdraw_master_jetton) {
+      ;; ensure call is not malicious
+      throw_unless(error::onchain_getter_invalid_sender, equal_msg_addr?(pyth_sender, my_address()));
+
+      var (evaa_operation_slice, master_jw_address, addr_hash, jetton_amount, initial_sender
+      ) = unpack_supply_withdraw_master_jetton(operation_body);
+
+      supply_withdraw_master_jetton_pyth_process(
+        my_balance, msg_value, evaa_operation_slice, ;; recv_internal params
+        master_jw_address, addr_hash, fwd_fee, ;; in_msg_full params
+        meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
+        query_id, jetton_amount, initial_sender,
+        packed_prices,
+        feeds_data, prices_ttl
+      );
+
+      return ();
+    }
+
+    slice initial_sender = pyth_sender; 
+
+    ;; proxy pattern: user --> pyth --> master --> ...
+    if (op_code == op::liquidate_master) {
+      ;; liquidate ton only
+      try {
+        liquidate_master_ton_pyth_process(
+          my_balance, msg_value, operation_body, ;; recv_internal params
+          initial_sender, fwd_fee, ;; in_msg_full params
+          meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
+          query_id, packed_prices, ;; trx body
+          feeds_data, prices_ttl
+        );
+      } catch (_, error_code) {
+        ;;since it ton tx we can just send tons
+        emit_log_crash(error_code, op_code, query_id);
+        liquidate_master_ton_pyth_handle_exception(
+          initial_sender, query_id, error_code, in_msg_full
+        );
+      }
+      return ();
+    }
+
+    ;; proxy pattern: user --> pyth --> master --> ...
+    if (op_code == op::supply_withdraw_master) {
+      try {
+        supply_withdraw_master_ton_pyth_process(
+          my_balance, msg_value, operation_body, ;; recv_internal params
+          initial_sender, fwd_fee, ;; in_msg_full params
+          meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
+          op, query_id, packed_prices, ;; trx body
+          feeds_data, prices_ttl
+        );
+      } catch (_, error_code) {
+        ;;since it ton tx we can just send tons
+        emit_log_crash(error_code, op_code, query_id);
+        supply_withdraw_master_ton_pyth_handle_exception(
+          initial_sender, query_id, error_code, in_msg_full
+        );
+      }
+      return ();
+    }
+  }
+
   int query_id = in_msg_body~load_query_id();
 
   if (op == op::get_store) {
     get_store_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
     );
     return ();
@@ -133,7 +224,7 @@
     init_master_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
     );
     return ();
@@ -143,7 +234,7 @@
     update_config_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
     );
     return ();
@@ -153,7 +244,7 @@
     add_new_token_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
     );
     return ();
@@ -163,7 +254,7 @@
     claim_asset_reserves_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
     );
     return ();
@@ -173,7 +264,7 @@
     force_enable_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
     );
     return ();
@@ -183,7 +274,7 @@
    force_disable_contract_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
    );
     return ();
@@ -193,7 +284,7 @@
     disable_contract_for_upgrade_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
     );
     return ();
@@ -203,7 +294,7 @@
     init_upgrade_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
     );
     return ();
@@ -213,7 +304,7 @@
     submit_upgrade_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
     );
     return ();
@@ -223,18 +314,27 @@
     cancel_upgrade_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
     );
     return ();
   }
   
-  ;; note: can be called by admin to idle other user sc / or can be called by user sc owner to idle his user sc
   if (op == op::idle_master) {
     idle_master_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+  
+  if (op == op::set_new_supervisor) {
+    set_new_supervisor_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
     );
     return ();
@@ -244,12 +344,10 @@
 
   ;; ------------------------- supply start -------------------------
   if (op == op::supply_master) {
-    ;; Allowed to throw, bounce will return TONs
-    ;; N.B. This flow is called ONLY for native TON supply
     supply_master_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
     );
     return ();
@@ -260,7 +358,7 @@
     supply_success_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
     );
     return ();
@@ -271,65 +369,86 @@
     supply_fail_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
     ); 
     return ();
   }
   ;; ------------------------- supply end -------------------------
 
-  ;; ------------------------- withdraw start -------------------------
-  if (op == op::withdraw_master) {
-    ;; Allowed to throw, bounce will return TONs
-    withdraw_master_process(
-      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
-      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
-      op, query_id ;; trx body
-    );
-    return ();
-  }
-
-  if (op == op::withdraw_collateralized) {
+  ;; --------------------- supply and withdraw start ----------------
+  if (op == op::supply_withdraw_master_without_prices) {
     try {
-      withdraw_collateralized_process(
-        my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
-        sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-        meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
-        op, query_id ;; trx body
+      supply_withdraw_master_ton_pyth_process(
+        my_balance, msg_value, in_msg_body, ;; recv_internal params
+        sender_address, fwd_fee, ;; in_msg_full params
+        meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
+        op, query_id, null(), ;; trx body
+        null(), 0
       );
     } catch (_, error_code) {
-      if (error_code == error::withdraw_collateralized_fake_sender) {
-        throw(error_code);
-      }
       emit_log_crash(error_code, op, query_id);
-      withdraw_collateralized_handle_exception(in_msg_body, sender_address, upgrade_config, query_id);
-      ;; Quis custodiet ipsos custodes? There is really nothing we can do if exception handler crashes.
-      ;; Therefore, minimum amount of parameters is passed and amount of code is used.
+      supply_withdraw_handle_exception(
+        my_balance, msg_value, in_msg_body, sender_address, fwd_fee, upgrade_config, asset_config_collection, query_id, error_code
+      );
     }
     return ();
   }
-  ;; ------------------------- withdraw end -------------------------
-  
-  ;; ------------------------- liquidate start -------------------------
-  if (op == op::liquidate_master) {
-    ;; Allowed to throw, bounce will return TONs
-    ;; N.B. This flow is called ONLY for liquidation with native TONs
-    liquidate_master_process(
-      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
-      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
-      op, query_id ;; trx body
-    );
+
+  if (op == op::supply_withdraw_unsatisfied) {
+    try {
+      supply_withdraw_unsatisfied_process(
+        my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+        sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+        meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
+        op, query_id ;; trx body
+      );
+    } catch (_, error_code) {
+      if (error_code == error::supply_withdraw_unsatisfied_fake_sender) {
+        throw(error_code);
+      }
+      emit_log_crash(error_code, op, query_id);
+      supply_withdraw_unsatisfied_handle_exception(
+        my_balance, msg_value, in_msg_body, sender_address, fwd_fee, upgrade_config, asset_config_collection, query_id
+      );
+    }
     return ();
   }
+
+  if (op == op::supply_withdraw_satisfied) {
+    try {
+      supply_withdraw_satisfied_process(
+        my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+        sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+        meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
+        op, query_id ;; trx body
+    );
+    } catch (_, error_code) {
+      if (error_code == error::supply_withdraw_satisfied_fake_sender) {
+        throw(error_code);
+      }
+      emit_log_crash(error_code, op, query_id);
+      supply_withdraw_satisfied_handle_exception(
+        my_balance, msg_value, in_msg_body, sender_address, fwd_fee, upgrade_config, asset_config_collection, query_id
+      );
+    }
+    return ();
+  }
+
+  ;; --------------------- supply and withdraw end ------------------
+  
+  ;; ------------------------- liquidate start -------------------------
+  ;; liquidate ton starts at processing pyth notification: user --> pyth --> master
+  ;; in case of error: user --> pyth --> user
+  ;; liquidate jetton starts at processing jetton transfer notification: user --> jetton --> master --> pyth --> master
+  ;; in case of error: ... --> master --> pyth --> master
 
   if (op == op::liquidate_unsatisfied) {
     ;; There is nothing we can do if this function crashes, it is already as simple as possible
     liquidate_unsatisfied_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+        meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
     );
     return ();
@@ -340,7 +459,7 @@
       liquidate_satisfied_process(
         my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
         sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-        meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+        meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
         op, query_id ;; trx body
       );
     } catch (_, error_code) {
@@ -355,13 +474,23 @@
     return ();
   }
   ;; ------------------------- liquidate end -------------------------
-  
+
   ;; ------------------------- other start -------------------------
   if (op == op::revert_call) {
     revert_call_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+        meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
+      op, query_id ;; trx body
+    );
+    return ();
+  }
+
+  if (op == op::add_to_reserve) {
+    add_to_reserve_process(
+      my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+      sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+        meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
     );
     return ();
@@ -376,7 +505,7 @@
     ;;    sender:MsgAddress
     ;;    forward_payload:(Either Cell ^Cell)
     int jetton_amount = in_msg_body~load_coins(); 
-    slice from_address = in_msg_body~load_msg_addr();
+    slice initial_sender = in_msg_body~load_msg_addr();
     
     ;; sender_address is the address of our jetton wallet
     ;; (which received money and notified us)
@@ -406,35 +535,75 @@
         supply_master_jetton_process(
           my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
           sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-          meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
-          jetton_op_code, query_id, jetton_amount, from_address, user_version, user_code ;; jetton tx body params
+          meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
+          jetton_op_code, query_id, jetton_amount, initial_sender, user_version, user_code ;; jetton tx body params
         );
         return ();
         ;; ------------------------- jetton supply end -------------------------
-      } elseif (jetton_op_code == op::liquidate_master) {
-        ;; ------------------------- jetton liquidate start -------------------------
-        liquidate_master_jetton_process(
+      }
+      elseif (jetton_op_code == op::supply_withdraw_master_without_prices) {
+        ;; --------------------- jetton supply and withdraw start --------------
+        supply_withdraw_master_jetton_without_prices_process(
           my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
           sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-          meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
-          jetton_op_code, query_id, jetton_amount, from_address, user_version, user_code ;; jetton tx body params
+          meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
+          jetton_op_code, query_id, jetton_amount, initial_sender, user_version, user_code ;; jetton tx body params
+        );
+        return ();
+      }
+      elseif (jetton_op_code == op::supply_withdraw_master_jetton) {
+        supply_withdraw_master_jetton_request_process(
+          my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+          sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+          meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
+          jetton_op_code, query_id, jetton_amount, initial_sender, user_version, user_code ;; jetton tx body params
+        );
+        return ();
+        ;; --------------------- jetton supply and withdraw end ----------------
+      }  
+      elseif (jetton_op_code == op::liquidate_master) {
+        ;; ------------------------- jetton liquidate start -------------------------
+        ;; make request to pyth to verify prices
+        liquidate_master_jetton_request(
+          my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+          sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+          meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
+          jetton_op_code, query_id, jetton_amount, initial_sender, user_version, user_code;; jetton tx body params
+        );
+        return ();
+        ;; ------------------------- jetton liquidate end -------------------------
+      } elseif (jetton_op_code == op::add_to_reserve) {
+        ;; ------------------------- jetton liquidate start -------------------------
+        add_to_reserve_jetton_process(
+          my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
+          sender_address, addr_hash, fwd_fee, ;; in_msg_full params
+          meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
+          jetton_op_code, query_id, jetton_amount, initial_sender, user_version, user_code ;; jetton tx body params
         );
         return ();
         ;; ------------------------- jetton liquidate end -------------------------
       } else {
+        msg_value -= (get_compute_fee(constants::wc_master, gas_consumed())
+          + fee::unfinished_runtime_gas
+          + storage_fees());
+        int forward_ton_amount = msg_value - fee::jetton_transfer;
         respond_send_jetton(
-          sender_address, from_address,
+          sender_address, initial_sender,
           query_id, jetton_amount,
-          begin_cell().store_op_code(error::unsupported_jetton_op_code).end_cell(), 0
+          begin_cell().store_op_code(error::unsupported_jetton_op_code).store_ref(in_msg_full).end_cell(), forward_ton_amount
         );
         return ();
       }
     } catch (_, error_code) {
       emit_log_crash(error_code, jetton_op_code, query_id);
+      msg_value -= (get_compute_fee(constants::wc_master, gas_consumed())
+            + fee::unfinished_runtime_gas
+            + storage_fees());
+      int forward_ton_amount = msg_value - fee::jetton_transfer;
       respond_send_jetton(
-        sender_address, from_address,
+        sender_address, initial_sender,
         query_id, jetton_amount,
-        begin_cell().store_op_code(error::jetton_execution_crashed).end_cell(), 0
+        begin_cell().store_op_code(error::jetton_execution_crashed).store_ref(in_msg_full).end_cell(), forward_ton_amount
       );
       return ();
     }
@@ -450,7 +619,7 @@
     do_data_checks_process(
       my_balance, msg_value, in_msg_full, in_msg_body, ;; recv_internal params
       sender_address, addr_hash, fwd_fee, ;; in_msg_full params
-      meta, upgrade_config, asset_config_collection, if_active, admin, oracles_info, tokens_keys, asset_dynamics_collection, ;; storage params
+      meta, upgrade_config, asset_config_collection, if_active, oracles_info, admin, tokens_keys, asset_dynamics_collection, supervisor, ;; storage params
       op, query_id ;; trx body
     );
     return ();

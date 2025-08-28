@@ -1,11 +1,7 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "../external/stdlib.fc";
 #include "../constants/fees.fc";
 #include "../storage/user-storage.fc";
 #include "../messages/supply-message.fc";
-#include "../messages/withdraw-message.fc";
 #include "../logic/tx-utils.fc";
 #include "../logic/user-utils.fc";
 
@@ -19,7 +15,8 @@
     int dust, int max_token_amount,
     int total_supply, int total_borrow,
     int tracking_supply_index, int tracking_borrow_index,
-    int forward_ton_amount, cell custom_response_payload) = parse_supply_user_message(in_msg_body);
+    cell custom_response_payload,
+    int subaccount_id, int return_repay_remainings_flag, slice custom_payload_recipient, int custom_payload_saturation_flag, slice initial_sender) = parse_supply_user_message(in_msg_body);
   
   ;; state check
   if (state != user_state::free) {
@@ -29,53 +26,76 @@
       pack_supply_fail_message(
         query_id, owner_address,
         asset_id, supply_amount_current,
-        forward_ton_amount, custom_response_payload
+        custom_response_payload, subaccount_id, return_repay_remainings_flag, initial_sender
       )
     );
     return ();
   }
-
-  ;; ???? What if Supply happens during liquidation?
-  ;; What to do with received funds?
-
-  ;; set new principal
-  int old_principal = user_principals.get_principal(asset_id);
-  int present = present_value(s_rate, b_rate, old_principal);
-  present += supply_amount_current;
-  int new_principal = principal_value(s_rate, b_rate, present);
   
+  (int old_principal, int origination_fee_taken, int amount_borrowed_without_fee, int last_borrow_mc_block_seqno) = user_principals.get_borrow_position_if_exist(asset_id);
+
+  int origination_fee_recovered = 0;
+  if (origination_fee_taken > 0) {
+    if ((get_last_mc_block_seqno() - last_borrow_mc_block_seqno) < constants::origination_fee_revert_mc_seqno_ttl) {
+      ;; revert borrow origination fee 
+      origination_fee_recovered = muldiv(origination_fee_taken, min(muldiv(supply_amount_current, constants::origination_fee_scale, amount_borrowed_without_fee), constants::origination_fee_scale), constants::origination_fee_scale);
+    }
+  }
+
+  int present = present_value(s_rate, b_rate, old_principal);
+
+  present += (supply_amount_current + origination_fee_recovered);
+  int new_principal = principal_value(s_rate, b_rate, present);
+
   if ((new_principal < dust) & (new_principal > 0)) { 
     new_principal = 0;
   }
 
-  (int repay_amount_principal,
-   int supply_amount_principal) = around_zero_split(old_principal, new_principal);
+  (int repay_amount_principal, int supply_amount_principal) = around_zero_split(old_principal, new_principal);
 
-  int new_total_supply = total_supply + supply_amount_principal;
-  int new_total_borrow = total_borrow - repay_amount_principal;
+  if (return_repay_remainings_flag & (repay_amount_principal > 0) & (supply_amount_principal > 0)) { ;; related to repay remainings
+    total_supply += 0; ;; just to indicate that we don't need to change total_supply
+    total_borrow -= repay_amount_principal;
+    new_principal = 0;
+  }
+  else {
+    total_supply += supply_amount_principal;
+    total_borrow -= repay_amount_principal;
 
-  ;; max cap check and negative new total borrow check
-  if (((new_total_supply > max_token_amount) & (max_token_amount != 0) & (supply_amount_principal > 0)) | (new_total_borrow < 0)) {
-    reserve_and_send_rest(
-      fee::min_tons_for_storage,
-      master_address,
-      pack_supply_fail_message(
-        query_id, owner_address,
-        asset_id, supply_amount_current,
-        forward_ton_amount, custom_response_payload
-      )
-    );
-    return ();
+    ;; max cap check and negative new total borrow check (only need this check in case of return_repay_remainings_flag == false)
+    if (((total_supply > max_token_amount) & (max_token_amount != 0) & (supply_amount_principal > 0)) | (total_borrow < 0)) {
+      reserve_and_send_rest(
+        fee::min_tons_for_storage,
+        master_address,
+        pack_supply_fail_message(
+          query_id, owner_address,
+          asset_id, supply_amount_current,
+          custom_response_payload, subaccount_id, return_repay_remainings_flag, initial_sender
+        )
+      );
+      return ();
+    }
   }
 
   user_principals~set_principal(asset_id, new_principal);
 
   ;; rewards tracking
   (int base_tracking_index, int base_tracking_accrued) = user_rewards.get_reward(asset_id);
-
   (base_tracking_index, base_tracking_accrued) = accrue_user_indexes(base_tracking_index, base_tracking_accrued, tracking_supply_index, tracking_borrow_index, old_principal, new_principal);
-
   user_rewards~set_reward(asset_id, base_tracking_index, base_tracking_accrued);
+
+  if (custom_payload_saturation_flag) {
+    custom_response_payload = begin_cell()
+                             .store_ref(custom_response_payload)
+                             .store_ref(begin_cell()
+                                       .store_dict(user_principals)
+                                       .store_dict(user_rewards)
+                                       .store_slice(owner_address)
+                                       .store_asset_id(asset_id)
+                                       .store_amount(supply_amount_current + origination_fee_recovered)
+                                       .end_cell())
+                             .end_cell();
+  }
 
   ;; success msg to master sc
   reserve_and_send_rest(
@@ -84,7 +104,8 @@
     pack_supply_success_message(
       query_id, owner_address,
       asset_id, supply_amount_current, new_principal,
-      repay_amount_principal, supply_amount_principal, custom_response_payload
+      repay_amount_principal, supply_amount_principal, custom_response_payload,
+      subaccount_id, return_repay_remainings_flag, custom_payload_recipient, custom_payload_saturation_flag
     )
   );
 
@@ -94,7 +115,7 @@
 
 () supply_user_handle_exception (slice in_msg_body, slice master_address, slice owner_address, int query_id) impure inline {
   (int asset_id, int supply_amount_current, _, _, _, _, _, _, _, _,
-    int forward_ton_amount, cell custom_response_payload) = parse_supply_user_message(in_msg_body);
+   cell custom_response_payload, int subaccount_id, int return_repay_remainings_flag, slice custom_payload_recipient, int custom_payload_saturation_flag, slice initial_sender) = parse_supply_user_message(in_msg_body);
 
   reserve_and_send_rest(
     fee::min_tons_for_storage,
@@ -102,7 +123,7 @@
     pack_supply_fail_message(
       query_id, owner_address,
       asset_id, supply_amount_current,
-      forward_ton_amount, custom_response_payload
+      custom_response_payload, subaccount_id, return_repay_remainings_flag, initial_sender
     )
   );
 }

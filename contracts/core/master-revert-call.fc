@@ -1,12 +1,10 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "../external/stdlib.fc";
 #include "../constants/errors.fc";
 #include "../data/basic-types.fc";
 #include "../messages/idle-message.fc";
 #include "../messages/liquidate-message.fc";
 #include "../messages/supply-message.fc";
+#include "../messages/supply-withdraw-message.fc";
 #include "../messages/upgrade-header.fc";
 #include "../logic/addr-calc.fc";
 #include "../logic/master-get-methods.fc";
@@ -15,49 +13,32 @@
 () revert_call_process  (
   int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
   slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
-  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor, ;; storage params
   int op, int query_id ;; trx body
 ) impure inline {
   slice owner_address = in_msg_body~load_msg_addr();
 
-  ;; Verify this is a message from lending-user smart contract
-  throw_unless(
-    error::revert_fake_sender,
-    slice_data_equal?(
-      sender_address,
-      calculate_user_address(BLANK_CODE(), owner_address)
-    )
-  );
+  ;; Cannot verify this is a message from lending-user smart contract because do not know subaccount id yet (verification done in each opcode)
 
   slice revert_body = in_msg_body.preload_ref().begin_parse();
 
   (int user_code_version, cell upgrade_info_cell,
-   int upgrade_exec
+    int upgrade_exec
   ) = revert_body~user::upgrade::load_header();
-
-  ;; upgrade_exec - why does it even exist?
-  ;; throw_if(error::cant_revert_upgrade_exec, upgrade_exec);
-  
-  ;; It should be possible to revert requests with upgrade_exec,
-  ;; but that would require master.fc to also have access to the specific on_upgrade function that was supposed to be executed on the User.
-  ;; This specific Master version doesn't have it yet.
-  ;; todo: !!!! whoever came up with the idea for upgrade_exec,
-  ;; take a look at this code
-
-  ;; Revert is possible in two cases: if upgrade fails or if opcode does not exist
-  ;; Process sends back the assets in case of these situations
-  ;; As of now it is not neccessary to check why this happened, always return
-
-  ;; Specific revert operations might depend on the specific user_code_version in the future
 
   int revert_op = revert_body~load_op_code();
   int revert_query_id = revert_body~load_query_id();
 
   if (revert_op == op::supply_user) {
-    ;; As this has to do with supply refund,
-    ;; the code is very similar to op::supply_fail
-    ;; except that the authenticity check had already been made
-    (int asset_id, int supply_amount_current, int s_rate, int b_rate, _, _, _, _, _, _, _, _) = parse_supply_user_message(revert_body);
+    (int asset_id, int supply_amount_current, int s_rate, int b_rate, _, _, _, _, _, _, cell custom_response_payload, int subaccount_id, int return_repay_remainings_flag, slice custom_payload_recipient, int custom_payload_saturation_flag, slice initial_sender) = parse_supply_user_message(revert_body);
+
+    throw_unless(
+      error::revert_fake_sender,
+      slice_data_equal?(
+        sender_address,
+        calculate_user_address(BLANK_CODE(), owner_address, subaccount_id)
+      )
+    );
 
     (int s_rate, int b_rate,
       int total_supply_principal, int total_borrow_principal,
@@ -77,34 +58,69 @@
       new_awaited_supply
     );
 
-    msg_value -= fee::revert_call;
+    msg_value -= (fee::revert_call
+                + modest_fwd_fee_estimation(fwd_fee)
+                + get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
+                
 
-    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(asset_id);
-    send_asset(
+    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+      _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(asset_id);
+  
+    int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+    send_asset_ext(
       owner_address, revert_query_id,
       jw_address_hash, supply_amount_current,
-      msg_value
-      ;; todo: !! Need to send some kind of info to the Owner?
+      forward_ton_amount,
+      begin_cell().store_op_code(op::supply_fail_revert).store_query_id(revert_query_id).store_ref(custom_response_payload).end_cell(), 
+      sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
     );
 
     master::storage::save(
       meta, upgrade_config,
       asset_config_collection,
       if_active, oracles_info, admin, tokens_keys,
-      asset_dynamics_collection
+      asset_dynamics_collection, supervisor
     );
 
     return ();
   }
 
-  if (revert_op == op::withdraw_user) {
-    ;; No assets are attached with request for Withdraw
-    ;; => It's enough to only refund attached (for network fees) TONs
-    ;; (no need to parse message)
-    send_message(
-      owner_address,
-      0,
-      null(), ;; todo: !! Need to send some kind of info to the Owner?
+  if (revert_op == op::supply_withdraw_user) {
+    (
+      int supply_amount, int supply_asset_id,
+      int withdraw_amount, int withdraw_asset_id, slice recipient_address_of_withdraw, cell prices_packed,
+      cell asset_config_collection, cell asset_dynamics_collection,
+      int ton_amount_for_repay_remainings, cell custom_response_payload, int subaccount_id, int return_repay_remainings_flag, int custom_payload_saturation_flag
+    ) = parse_supply_withdraw_user_message(revert_body);
+
+    msg_value -= fee::revert_call;
+
+    msg_value -= (modest_fwd_fee_estimation(fwd_fee)
+                + get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
+
+    throw_unless(
+      error::revert_fake_sender,
+      slice_data_equal?(
+        sender_address,
+        calculate_user_address(BLANK_CODE(), owner_address, subaccount_id)
+      )
+    );
+
+    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+      _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(supply_asset_id);
+
+    int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+    send_asset_ext(
+      owner_address, revert_query_id,
+      jw_address_hash, supply_amount,
+      forward_ton_amount,
+      begin_cell().store_op_code(op::supply_withdraw_fail).store_query_id(revert_query_id).store_ref(custom_response_payload).end_cell(),
       sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
     );
 
@@ -116,21 +132,40 @@
     ;; the code is very similar to op::liquidate_unsatisfied
     ;; except that the authenticity check had already been made
     (cell asset_config_collection, cell asset_dynamics_collection, cell prices_packed,
-     int collateral_asset_id, int min_collateral_amount,
-     slice liquidator_address,
-     int transferred_asset_id, int transferred_amount,
-     int forward_ton_amount, cell custom_response_payload
-     )
+      int collateral_asset_id, int min_collateral_amount,
+      slice liquidator_address,
+      int transferred_asset_id, int transferred_amount,
+      cell custom_response_payload,
+      int subaccount_id, slice custom_payload_recipient, int custom_payload_saturation_flag
+    )
       = parse_liquidate_user_message(revert_body);
+
+    throw_unless(
+      error::revert_fake_sender,
+      slice_data_equal?(
+        sender_address,
+        calculate_user_address(BLANK_CODE(), owner_address, subaccount_id)
+      )
+    );
 
     msg_value -= fee::revert_call;
 
-    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(transferred_asset_id);
-    send_asset(
+    msg_value -= (modest_fwd_fee_estimation(fwd_fee)
+                + get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
+                
+    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+      _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(transferred_asset_id);
+
+    int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+    send_asset_ext(
       liquidator_address, revert_query_id,
       jw_address_hash, transferred_amount,
-      msg_value
-      ;; todo: !! Need to send some kind of info to the Owner?
+      forward_ton_amount,
+      begin_cell().store_op_code(op::liquidate_fail_revert).store_query_id(revert_query_id).store_ref(custom_response_payload).end_cell(), 
+      sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
     );
 
     return ();
@@ -142,12 +177,20 @@
     ;; but in this case we need to refund to the Originator (who can be either Owner or Admin)
     ;; It doesn't matter too much, because of the little amount in question,
     ;; but let's do it properly
-    (cell tokens_keys, slice originator_address) = parse_idle_user_message(revert_body);
+    (slice originator_address, int subaccount_id) = parse_idle_user_message(revert_body);
+
+    throw_unless(
+      error::revert_fake_sender,
+      slice_data_equal?(
+        sender_address,
+        calculate_user_address(BLANK_CODE(), owner_address, subaccount_id)
+      )
+    );
 
     send_message(
       originator_address,
       0,
-      null(), ;; todo: !! Need to send some kind of info to the Originator?
+      null(),
       sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
     );
 

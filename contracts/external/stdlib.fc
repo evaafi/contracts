@@ -1,6 +1,3 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 ;; Standard library for funC
 ;;
 
@@ -234,6 +231,18 @@ cont get_c3() impure asm "c3 PUSH";
 ;;; (and the stack of recursive function calls) won't change,
 ;;; but any other function call will use a function from the new code.
 () set_c3(cont c) impure asm "c3 POP";
+
+tuple get_prev_mc_blocks() asm "PREVMCBLOCKS";
+
+;;; Returns the current value of `c7`.
+tuple _get_c7() impure asm "c7 PUSH";
+
+;;; Updates the current value of `c7`.
+() _set_c7(tuple c) impure asm "c7 POP";
+
+forall X -> tuple tset(tuple t, int k, X x) asm(t x k) "SETINDEXVAR";
+forall X -> (tuple, ()) ~tset(tuple t, int k, X x) asm(t x k) "SETINDEXVAR";
+
 
 ;;; Transforms a `slice` [s] into a simple ordinary continuation `c`, with `c.code = s` and an empty stack and savelist.
 cont bless(slice s) impure asm "BLESS";
@@ -675,7 +684,7 @@ int get_simple_forward_fee(int workchain, int bits, int cells) asm(cells bits wo
 int get_original_fwd_fee(int workchain, int fwd_fee) asm(fwd_fee workchain) "GETORIGINALFWDFEE";
 int my_storage_due() asm "DUEPAYMENT";
 
-tuple get_fee_cofigs() asm "UNPACKEDCONFIGTUPLE";
+tuple get_fee_configs() asm "UNPACKEDCONFIGTUPLE";
 
 ;; ===== ADDRESS =====
 
@@ -1219,3 +1228,17 @@ int check_signature(int hash, slice signature, int public_key) asm "CHKSIGNU";
 (slice, slice) load_bits_refs(slice s, int bits, int refs) asm "SPLIT" "SWAP";
 (slice, (slice)) ~load_bits_refs(slice s, int bits, int refs) asm "SPLIT" "SWAP";
 cell get_code() asm "MYCODE";
+
+;; ;;; Checks whether the data parts of two slices coinside
+;; int equal_slices_bits(slice a, slice b) asm "SDEQ";
+
+;; Missing raw reserve constants (backported from Tolk)
+
+;; +1: Actually reserves all but amount, meaning `currentContractBalance - amount`
+const reserve::ALL_BUT_AMOUNT = 1;
+;; +4: [amount] is increased by the _original_ balance of the current account (before the compute phase).
+const reserve::INCREASE_BY_ORIGINAL_BALANCE = 4;
+;; +8: Actually sets `amount = -amount` before performing any further actions.
+const reserve::NEGATE_AMOUNT = 8;
+
+int sign(int x) asm "SGN";

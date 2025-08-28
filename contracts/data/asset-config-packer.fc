@@ -1,12 +1,9 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "../external/stdlib.fc";
 #include "../data/basic-types.fc";
 
 ;; --------------- Structure methods ---------------
 
-(int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int) unpack_asset_config(slice asset_config) {
+(int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int) unpack_asset_config(slice asset_config) {
 	int jw_address_hash = asset_config~load_uint(256); 
 	int decimals = asset_config~load_uint(8);
 	
@@ -29,7 +26,11 @@
 	int liquidation_reserve_factor = asset_config_params~load_uint(16); 
 	int min_principal_for_rewards = asset_config_params~load_uint(64); 
 	int base_tracking_supply_speed = asset_config_params~load_uint(64); 
-	int base_tracking_borrow_speed = asset_config_params~load_uint(64); 
+	int base_tracking_borrow_speed = asset_config_params~load_uint(64);
+	int borrow_cap = asset_config_params~load_int(64);
+	int he_category = asset_config_params~load_uint(8);
+	int he_collateral_factor = asset_config_params~load_uint(16);
+	int he_liquidation_threshold = asset_config_params~load_uint(16);
 
   return (
 		jw_address_hash, decimals,
@@ -41,7 +42,8 @@
 		dust_value, max_total_supply,
 		reserve_factor, liquidation_reserve_factor,
 		min_principal_for_rewards, base_tracking_supply_speed,
-		base_tracking_borrow_speed
+	  	base_tracking_borrow_speed, borrow_cap,
+	  	he_category, he_collateral_factor, he_liquidation_threshold
 	);
 }
 
@@ -55,7 +57,8 @@ cell pack_asset_config(
 		int origination_fee, int dust_value, int max_total_supply,
 		int reserve_factor, int liquidation_reserve_factor,
 		int min_principal_for_rewards, int base_tracking_supply_speed,
-		int base_tracking_borrow_speed
+		int base_tracking_borrow_speed, int borrow_cap,
+		int he_category, int he_collateral_factor, int he_liquidation_threshold
 ) {
 	return begin_cell()
 		.store_uint(jw_address_hash, 256)
@@ -78,26 +81,28 @@ cell pack_asset_config(
 			.store_uint(min_principal_for_rewards, 64)
 			.store_uint(base_tracking_supply_speed, 64)
 			.store_uint(base_tracking_borrow_speed, 64)
+			.store_int(borrow_cap, 64)
+			.store_uint(he_category, 8)
+			.store_uint(he_collateral_factor, 16)
+			.store_uint(he_liquidation_threshold, 16)
 		.end_cell())
 	.end_cell();
 }
 
-
-
 ;; --------------- Collection methods ---------------
 
-(int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int)
+(int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int)
 	asset_config_collection:get_unpacked(cell asset_config_collection, int asset_id)
 {
 	(slice asset_config, _) = asset_config_collection.udict_get?(256, asset_id);
 	return unpack_asset_config(asset_config);
 }
 
-;; for future use
 int asset_config_collection:get_jetton_wallet(cell asset_config_collection, int asset_id)
 {
 	(slice asset_config, _) = asset_config_collection.udict_get?(256, asset_id);
-	(int jetton_wallet, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config.unpack_asset_config();
+	(int jetton_wallet, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+		_, _, _, _) = asset_config.unpack_asset_config();
 	return jetton_wallet;
 }
 

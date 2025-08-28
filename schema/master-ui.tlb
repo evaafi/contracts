@@ -1,6 +1,3 @@
-// This file is licensed under the Business Source License (BUSL).
-// See the LICENSE.md file in the project root for more information.
-
 // Bool in get-methods must be represented as int. 0 = false, -1 = true.
 
 // Method name: getCollateralQuote
@@ -77,6 +74,11 @@ get_ui_variables$_ asset_dynamics_collection:AssetDynamicsCollection config:Conf
 // Out values: (user_address: MsgAddressInt)
 get_user_address$_ user_address:MsgAddressInt = GetMethodResult;
 
+// Method name: get_user_subaccount_address
+// In args: (owner_address: MsgAddressInt, subaccount_id: int)
+// Out values: (user_address: MsgAddressInt)
+get_user_subaccount_address$_ user_address:MsgAddressInt = GetMethodResult;
+
 // Method name: claim_asset_reserves_min_attachment
 // In args: (fwd_fee: int)
 // Out values: (min_attachment_amount: int)
@@ -91,11 +93,6 @@ dummy_supply_user_message$_ supply_user:UserCommand = GetMethodResult;
 // In args: (fwd_fee: int, supply_user_message: UserCommand)
 // Out values: (min_attachment_amount: int)
 supply_min_attachment$_ amount:int256 = GetMethodResult;
-
-// Method name: dummy_withdraw_user_message
-// In args: ()
-// Out values: (withdraw_user: UserCommand)
-dummy_withdraw_user_message$_ withdraw_user:UserCommand = GetMethodResult;
 
 // Method name: withdraw_min_attachment
 // In args: (fwd_fee: int, withdraw_user_message: UserCommand)
@@ -116,6 +113,16 @@ liquidate_min_attachment$_ amount:int256 = GetMethodResult;
 // In args: (asset_id: int)
 // Out values: (total_supply_principal: int, total_borrow_principal: int)
 get_asset_total_principals$_ total_supply_principal:int256 total_borrow_principal:int256 = GetMethodResult;
+
+// Method name: dummy_supply_withdraw_user_message
+// In args: ()
+// Out values: (withdraw_user: UserCommand)
+dummy_supply_withdraw_user_message$_ supply_withdraw_user:UserCommand = GetMethodResult;
+
+// Method name: supply_withdraw_min_attachment
+// In args: (fwd_fee: int, supply_withdraw_user_message: UserCommand)
+// Out values: (min_attachment_amount: int)
+supply_withdraw_min_attachment$_ amount:int256 = GetMethodResult;
 
 // Method name: get_asset_balance
 // In args: (asset_id: int)
@@ -161,3 +168,15 @@ get_upgrade_config$_ upgrade_config:UpgradeConfig = GetMethodResult;
 // In args: (asset_id: int)
 // Out values: (tracking_supply_index: int, tracking_borrow_index: int, last_accrual: int)
 get_asset_tracking_info$_ tracking_supply_index:int256 tracking_borrow_index:int256 last_accrual:int256 = GetMethodResult;
+
+// Method name: get_supervisor
+// In args: ()
+// Out values: (supervisor: MsgAddressInt)
+get_active$_ supervisor:MsgAddressInt = GetMethodResult;
+
+// Method name: get_oracles_info
+// In args: ()
+// Out values: (pyth_address: MsgAddressInt, pyth_evaa_ids: (HashmapE 256 PythMapItem), prices_ttl: int,
+//              pyth_compute_base_gas: int, pyth_compute_per_update_gas: int, pyth_single_update_fee: int)
+get_oracles_info$_ pyth_address:MsgAddressInt pyth_evaa_ids:(HashmapE 256 PythMapItem) prices_ttl:int
+                   pyth_compute_base_gas:int pyth_compute_per_update_gas:int pyth_single_update_fee:int = GetMethodResult;

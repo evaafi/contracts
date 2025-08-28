@@ -1,0 +1,3 @@
+#include "../../external/stdlib.fc";
+
+int tlen(tuple t) asm "TLEN";

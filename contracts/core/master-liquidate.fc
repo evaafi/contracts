@@ -1,16 +1,19 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "../constants/constants.fc";
 #include "../external/stdlib.fc";
 #include "../constants/errors.fc";
 #include "../constants/logs.fc";
+#include "../constants/op-codes.fc";
 #include "../data/basic-types.fc";
+#include "../data/oracles-info.fc";
 #include "../messages/liquidate-message.fc";
 #include "../logic/addr-calc.fc";
 #include "../logic/master-get-methods.fc";
 #include "../logic/tx-utils.fc";
 #include "../logic/utils.fc";
+#include "../storage/master-storage.fc";
+#include "../plugins/pyth/parse_price_feeds.fc";
+#include "../plugins/pyth/pyth_request.fc";
+#include "../plugins/pyth/stdlib.fc";
 
 cell master_core_logic_liquidate_asset_unchecked(
   int user_version, cell user_code, int query_id,
@@ -19,10 +22,11 @@ cell master_core_logic_liquidate_asset_unchecked(
   int collateral_asset_id, int min_collateral_amount,
   slice liquidator_address,
   int transferred_asset_id, int transferred_amount,
-  int TON_reserve_amount, 
-  int forward_ton_amount, cell custom_response_payload,
+  int TON_reserve_amount,
+  cell custom_response_payload,
   cell prices_packed,
-  int fwd_fee, int msg_value
+  int fwd_fee, int msg_value,
+  int subaccount_id, slice custom_payload_recipient, int custom_payload_saturation_flag
 ) impure {
   (_, _, _, _, _, int token_balance, _, _, _) =
     asset_dynamics_collection.asset_dynamics_collection:get_unpacked(collateral_asset_id);
@@ -31,36 +35,41 @@ cell master_core_logic_liquidate_asset_unchecked(
     asset_config_collection, collateral_asset_id, transferred_asset_id
   );
 
-  ;; ----- Check: don't liquidate too much -----
-  ;; I was thinking if we can calculate collateral_amount here on master, but looks like "no" because we don't know user's loan_present (of the transferred_asset_id).
-  ;; Or we'd have to either:
-  ;; a) strict-reject liquidation (on User) if user doesn't have enough loan_present (instead of soft-accepting it with lower liquidatable_amount)
-  ;; b) use the value calculated on master for checking that the liquidation doesn't liquidate too much of master's assets and (in case loan_present is < transferred_amount) recalculate get_collateral_quote
-  ;;NOTE if we want to set liquidity as supply - borrow then uncomment here
-  ;;int collateral_liquidity = get_asset_liquidity(
-  ;;  total_supply_principal, total_borrow_principal,
-  ;;  s_rate, b_rate
-  ;;);
   int collateral_liquidity = token_balance;
 
   int max_allowed_liquidation = muldiv(collateral_liquidity, 3, 4);
-  ;; Specific comparison below with 3/4th is a bit arbitrary
-  if (min_collateral_amount > max_allowed_liquidation) {
-    ;; Liquidating too much of our liquidity at once
-    ;; This is not allowed, because there is a higher chance that after getting a liquidation-approval from the User smart contract (and corresponding locking of funds there), the 3rd and the final phase of checks (on the Master: is there enough liquidity) will fail causing the liquidation failure and "revert".
-    ;; The bad part is that after 2nd phase of checks (on the User) funds there get temporarily locked and become unavailable for further liquidation -> thus making it (theoretically?) possible to prevent liquidation of the specific Owner by spamming large liquidation requests.
-    ;; Check with min_collateral_amount (instead of final collateral_amount) is not "directly" bulletproof: hacker may set low min_collateral_amount, but that would risk a lot of his funds because of all soft-checks that allow liquidation to proceed as long as min_collateral_amount is satisfied.
 
-    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _
-    ) = asset_config_collection.asset_config_collection:get_unpacked(transferred_asset_id);
+  cell liquidate_user_message = pack_liquidate_user_message(
+    query_id,
+    asset_config_collection, asset_dynamics_collection,
+    collateral_asset_id, min_collateral_amount,
+    liquidator_address,
+    transferred_asset_id, transferred_amount,
+    custom_response_payload,
+    prices_packed,
+    subaccount_id, custom_payload_recipient, custom_payload_saturation_flag
+  );
+
+  int enough_fee = liquidate_min_attachment(fwd_fee, liquidate_user_message);
+
+  if ((min_collateral_amount > max_allowed_liquidation) | (msg_value < enough_fee)) {
+    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(transferred_asset_id);
+
+    msg_value -= (modest_fwd_fee_estimation(fwd_fee)
+                + fee::liquidate_master
+                + get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
+              
+    int forward_ton_amount = msg_value - fee::jetton_transfer;
 
     ;; Refund asset
     immediate_asset_refund(
       liquidator_address,
       query_id,
-      jw_address_hash, transferred_amount, 
+      jw_address_hash, transferred_amount,
       pack_liquidation_fail_report_message(
-        build_master_liquidating_too_much_error(max_allowed_liquidation),
+        min_collateral_amount > max_allowed_liquidation ? build_master_liquidating_too_much_error(query_id, max_allowed_liquidation) : begin_cell().store_op_code(error::liquidate_asset_transaction_fees).store_query_id(query_id),
         custom_response_payload
       ), forward_ton_amount
     );
@@ -68,30 +77,13 @@ cell master_core_logic_liquidate_asset_unchecked(
     ;; Note that we don't break execution:
     ;; We update asset_dynamics_collection with new s/b-rates regardless
   } else {
-    raw_reserve(TON_reserve_amount, reserve::AT_MOST + 2);
+    raw_reserve(TON_reserve_amount, reserve::INCREASE_BY_ORIGINAL_BALANCE);
 
-    cell liquidate_user_message = pack_liquidate_user_message(
-      query_id,
-      asset_config_collection, asset_dynamics_collection,
-      collateral_asset_id, min_collateral_amount,
-      liquidator_address,
-      transferred_asset_id, transferred_amount, 
-      forward_ton_amount, custom_response_payload,
-      prices_packed
-    );
-
-    int enough_fee = liquidate_min_attachment(fwd_fee, liquidate_user_message) + forward_ton_amount;
-
-    throw_unless(
-      error::liquidate_asset_transaction_fees,
-      msg_value >= enough_fee
-    );
-
-    send_message_to_lending_wallet(
+    send_message_to_evaa_user_sc(
       BLANK_CODE(), user_version, user_code, borrower_address, ;; <- the meaning is of owner_address
       liquidate_user_message,
-      sendmode::CARRY_ALL_BALANCE ;; <- in combination with raw_reserve with mode=4
-      ;; should resend the whole value of the original message minus "amount" and fees
+      sendmode::CARRY_ALL_BALANCE,
+      subaccount_id
     );
   }
 
@@ -106,8 +98,9 @@ cell liquidate_jetton(
   int collateral_asset_id, int min_collateral_amount,
   slice liquidator_address,
   int transferred_asset_id, int transferred_amount,
-  int forward_ton_amount, cell custom_response_payload,
-  cell prices_packed
+  cell custom_response_payload,
+  cell prices_packed,
+  int subaccount_id, slice custom_payload_recipient, int custom_payload_saturation_flag
 ) impure inline {
   return master_core_logic_liquidate_asset_unchecked(
     user_version, user_code, query_id,
@@ -117,9 +110,10 @@ cell liquidate_jetton(
     liquidator_address,
     transferred_asset_id, transferred_amount,
     0, ;; TON_reserve_amount
-    forward_ton_amount, custom_response_payload,
+    custom_response_payload,
     prices_packed,
-    fwd_fee, msg_value
+    fwd_fee, msg_value,
+    subaccount_id, custom_payload_recipient, custom_payload_saturation_flag
   );
 }
 
@@ -129,9 +123,10 @@ cell liquidate_ton(
   int msg_value, int liquidate_incoming_amount, int fwd_fee,
   slice borrower_address,
   int collateral_asset_id, int min_collateral_amount,
-  slice liquidator_address, 
-  int forward_ton_amount, cell custom_response_payload,
-  cell prices_packed
+  slice liquidator_address,
+  cell custom_response_payload,
+  cell prices_packed,
+  int subaccount_id, slice custom_payload_recipient, int custom_payload_saturation_flag
 ) impure inline {
   ;; we don't reserve TON yet
   ;; liquidation might fail right away
@@ -146,27 +141,60 @@ cell liquidate_ton(
     ;; Withhold some amount of TONs for blockchain fees
     liquidate_incoming_amount,
     liquidate_incoming_amount, ;; TON_reserve_amount
-    forward_ton_amount, custom_response_payload,
+    custom_response_payload,
     prices_packed,
-    fwd_fee, msg_value - liquidate_incoming_amount
+    fwd_fee, msg_value - liquidate_incoming_amount,
+    subaccount_id, custom_payload_recipient, custom_payload_saturation_flag
   );
 }
 
-() liquidate_master_process  (
-  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
-  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
-  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
-  int op, int query_id ;; trx body
+() liquidate_master_ton_pyth_process  (
+  int my_balance, int msg_value, slice operation_body, ;; recv_internal params
+  slice initial_sender, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor, ;; storage params
+  int query_id, ;; trx body
+  cell prices_packed,  ;; prices
+  cell feeds_map, int prices_ttl
 ) impure inline {
-  (slice borrower_address, slice liquidator_address, int collateral_asset_id, int min_collateral_amount, int liquidate_incoming_amount, int include_user_code, int forward_ton_amount, cell custom_response_payload, cell prices_packed) = parse_liquidate_master_message(in_msg_body);
+  (slice borrower_address, int collateral_asset_id, int min_collateral_amount, int liquidate_incoming_amount, int include_user_code,  cell requested_ref_tokens,
+    cell custom_response_payload, int subaccount_id, slice custom_payload_recipient, int custom_payload_saturation_flag) = parse_liquidate_master_message(operation_body);
 
-  throw_unless(error::invalid_address_provided, is_valid_address?(borrower_address));
-  throw_unless(error::invalid_address_provided, is_valid_address?(liquidator_address));
-  throw_if(error::invalid_data, collateral_asset_id == constants::ton_asset_id);
-  throw_unless(error::custom_response_payload_too_big, is_valid_custom_response_payload?(custom_response_payload));
+  if(custom_payload_recipient.null?()) {
+    custom_payload_recipient = initial_sender;
+  }
 
-  int prices_error_code = prices_packed~prices_packed:error(oracles_info);
-  throw_if(prices_error_code, prices_error_code); ;; non-zero codes throw
+  slice custom_response_payload_open = custom_response_payload.begin_parse();
+  cell custom_response_payload_extended = custom_response_payload;
+
+  ifnot (custom_response_payload_open.slice_empty?()) {
+    custom_response_payload_extended = begin_cell()
+				.store_slice(initial_sender)
+				.store_ref(custom_response_payload)
+			.end_cell(); 
+  }
+
+  (_, int is_ton_supported) = asset_config_collection.udict_get?(256, constants::ton_asset_id);
+  int addresses_not_valid = ~ (is_valid_address?(borrower_address) & is_valid_address?(custom_payload_recipient));
+  (_, int is_collateral_asset_exist) = asset_config_collection.udict_get?(256, collateral_asset_id);
+  int data_not_valid = (collateral_asset_id == constants::ton_asset_id) | (~ is_collateral_asset_exist);
+  int custom_payload_not_valid = ~ is_valid_custom_response_payload?(custom_response_payload);
+
+  int prices_not_valid = prices_packed~packed_price:parse_check(feeds_map, requested_ref_tokens, prices_ttl);
+
+  if (addresses_not_valid | data_not_valid | custom_payload_not_valid | prices_not_valid | (~ is_ton_supported)) {
+    int error_code = addresses_not_valid ? error::invalid_address_provided :
+                      data_not_valid ? error::invalid_data :
+                      custom_payload_not_valid ? error::custom_response_payload_too_big :
+                      (~ is_ton_supported) ? error::ton_unsupported :
+                      prices_not_valid;
+    send_message(
+      initial_sender,
+      0,
+      begin_cell().store_op_code(error_code).store_query_id(query_id).store_ref(custom_response_payload_extended).end_cell(),
+      sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
+    );
+    return ();
+  }
 
   (_, int user_version, _, _, _, cell user_code, _, _) = upgrade_config.unpack_upgrade_config();
 
@@ -176,7 +204,8 @@ cell liquidate_ton(
     msg_value, liquidate_incoming_amount, fwd_fee,
     borrower_address,
     collateral_asset_id, min_collateral_amount,
-    liquidator_address, forward_ton_amount, custom_response_payload, prices_packed
+    initial_sender, custom_response_payload_extended, prices_packed,
+    subaccount_id, custom_payload_recipient, custom_payload_saturation_flag
   );
   ;; The only reason we save is to update s/b-rate of the corresponding asset
   ;; this is just a request to liquidate, no confirmation yet,
@@ -184,8 +213,8 @@ cell liquidate_ton(
   master::storage::save(
     meta, upgrade_config,
     asset_config_collection,
-    if_active, oracles_info, admin, tokens_keys, 
-    asset_dynamics_collection
+    if_active, oracles_info, admin, tokens_keys,
+    asset_dynamics_collection, supervisor
   );
   return ();
 }
@@ -193,14 +222,15 @@ cell liquidate_ton(
 () liquidate_unsatisfied_process  (
   int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
   slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
-  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor, ;; storage params
   int op, int query_id ;; trx body
 ) impure inline {
   var (
     owner_address, liquidator_address,
     transferred_asset_id, transferred_amount,
     collateral_asset_id, min_collateral_amount,
-    forward_ton_amount, custom_response_payload,
+    custom_response_payload,
+    subaccount_id,
     error
   ) = parse_liquidate_unsatisfied_message(in_msg_body);
 
@@ -209,31 +239,32 @@ cell liquidate_ton(
     error::liquidate_unsatisfied_fake_sender,
     slice_data_equal?(
       sender_address,
-      calculate_user_address(BLANK_CODE(), owner_address)
+      calculate_user_address(BLANK_CODE(), owner_address, subaccount_id)
     )
   );
 
   msg_value -= fee::liquidate_unsatisfied;
 
-  (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(transferred_asset_id);
+  msg_value -= (modest_fwd_fee_estimation(fwd_fee)
+                + get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
 
-  if (transferred_asset_id == constants::ton_asset_id){
-    raw_reserve(my_balance - transferred_amount - msg_value, reserve::REGULAR);
-  } else {
-    raw_reserve(0, 4);
-  }
+  int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+  (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+    _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(transferred_asset_id);
 
   send_asset_ext(
     liquidator_address, query_id,
     jw_address_hash, transferred_amount,
     forward_ton_amount,
-    pack_liquidation_fail_report_message(begin_cell().store_slice(error), custom_response_payload),
-    sendmode::CARRY_ALL_BALANCE ;; <- in combination with raw_reserve with mode=4
+    pack_liquidation_fail_report_message(begin_cell().store_slice(error), custom_response_payload), ;;error with query_id already from user sc
+    sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE 
   );
   ;; ^ Note how we don't check if that asset is available for refund,
   ;; because it HAS to be available
   ;; This is due to the fact that when we received the asset to use for liquidation, we didn't increase the in-storage balance of this asset's availability, thus making it not possible to use the received asset for anything other than the Refund
-
   ;; Due to the same reason,
   ;; we DON'T need to save anything to contract storage here - nothing changes there
   return ();
@@ -242,7 +273,7 @@ cell liquidate_ton(
 () liquidate_satisfied_process  (
   int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
   slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
-  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor, ;; storage params
   int op, int query_id ;; trx body
 ) impure inline {
   var (
@@ -253,7 +284,8 @@ cell liquidate_ton(
     collateral_asset_id,
     delta_collateral_principal, collateral_reward,
     min_collateral_amount,
-    new_user_collateral_principal, forward_ton_amount, custom_response_payload
+    new_user_collateral_principal, custom_response_payload,
+    subaccount_id, custom_payload_recipient, custom_payload_saturation_flag
   ) = parse_liquidate_satisfied_message(in_msg_body);
   ;; delta_loan_principal and delta_collateral_principal - are how much corresponding principals DECREASE
   ;; delta_collateral_principal is going to be positive, because collateral is going to be send to liquidator
@@ -265,24 +297,19 @@ cell liquidate_ton(
     error::liquidate_satisfied_fake_sender,
     slice_data_equal?(
       sender_address,
-      calculate_user_address(BLANK_CODE(), owner_address)
+      calculate_user_address(BLANK_CODE(), owner_address, subaccount_id)
     )
   );
 
   ;; Original amount sent for liquidation
   int transferred_amount = liquidatable_amount + protocol_gift;
   (int collateral_s_rate, int collateral_b_rate,
-   int collateral_total_supply_principal, int collateral_total_borrow_principal,
-   int collateral_last_accrual, int collateral_token_balance,
-   int collateral_tracking_supply_index, int collateral_tracking_borrow_index,
-   int collateral_awaited_supply
-   ) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(collateral_asset_id);
+    int collateral_total_supply_principal, int collateral_total_borrow_principal,
+    int collateral_last_accrual, int collateral_token_balance,
+    int collateral_tracking_supply_index, int collateral_tracking_borrow_index,
+    int collateral_awaited_supply
+  ) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(collateral_asset_id);
 
-  ;;NOTE if we want to set liquidity as supply - borrow then uncomment here
-  ;;int collateral_liquidity = get_asset_liquidity(
-  ;;  total_supply_principal, total_borrow_principal,
-  ;;  s_rate, b_rate
-  ;;);
   int collateral_liquidity = collateral_token_balance;
 
   if (collateral_reward <= collateral_liquidity) {
@@ -291,8 +318,8 @@ cell liquidate_ton(
     int new_collateral_total_supply = collateral_total_supply_principal - delta_collateral_principal;
     int new_collateral_total_borrow = collateral_total_borrow_principal;
 
-    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _
-    ) = asset_config_collection.asset_config_collection:get_unpacked(collateral_asset_id);
+    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+      _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(collateral_asset_id);
 
     ;; Update collateral balance
     asset_dynamics_collection~asset_dynamics_collection:set_packed(
@@ -311,7 +338,7 @@ cell liquidate_ton(
       int loan_last_accrual, int loan_token_balance,
       int loan_tracking_supply_index, int loan_tracking_borrow_index,
       int loan_awaited_supply
-      ) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(transferred_asset_id);
+    ) = asset_dynamics_collection.asset_dynamics_collection:get_unpacked(transferred_asset_id);
 
     int loan_new_total_supply = loan_total_supply_principal;
     int loan_new_total_borrow = loan_total_borrow_principal + delta_loan_principal;
@@ -328,12 +355,24 @@ cell liquidate_ton(
       loan_awaited_supply
     );
 
+    if (custom_payload_saturation_flag) {
+      slice custom_response_payload_open = custom_response_payload.begin_parse();
+      custom_response_payload = begin_cell()
+                          .store_ref(custom_response_payload_open~load_ref()) ;; custom response payload
+                          .store_ref(begin_cell()
+                                    .store_slice(custom_response_payload_open~load_ref().begin_parse()) ;; user_principals + user_rewards
+                                    .store_dict(asset_dynamics_collection)
+                                    .store_dict(asset_config_collection)
+                                    .end_cell())
+                          .end_cell();
+    }
+    
     ;; Notify lending-user of success
     ;; So it can decrease ongoing liquidation count
     int success_message_fee =
     modest_fwd_fee_estimation(fwd_fee) + fee::liquidate_success;
 
-    send_message_to_lending_wallet_by_address(
+    send_message_to_evaa_user_sc_by_address(
       null(), success_message_fee, ;; state_init don't need
       user_version, null(), ;; null upgrade_info
       sender_address, pack_liquidate_success_message(
@@ -341,13 +380,18 @@ cell liquidate_ton(
         transferred_asset_id, delta_loan_principal,
         loan_tracking_supply_index, loan_tracking_borrow_index,
         collateral_asset_id, delta_collateral_principal,
-        collateral_tracking_supply_index, collateral_tracking_borrow_index
+        collateral_tracking_supply_index, collateral_tracking_borrow_index,
+        subaccount_id
       ),
       sendmode::REGULAR
     );
 
     msg_value -= success_message_fee;
-    msg_value -= fee::log_tx;
+
+    msg_value -= (modest_fwd_fee_estimation(fwd_fee) + fee::liquidate_satisfied
+                + get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
 
     cell log_data = begin_cell()
       .store_uint(log::liquidate_success, 8) ;; withdraw code
@@ -378,13 +422,15 @@ cell liquidate_ton(
     emit_log_simple(log_data);
 
     if (collateral_asset_id == constants::ton_asset_id){
-      raw_reserve(my_balance - collateral_reward - msg_value, reserve::REGULAR);
+      raw_reserve(collateral_reward, reserve::INCREASE_BY_ORIGINAL_BALANCE | reserve::NEGATE_AMOUNT);
     } else {
-      raw_reserve(0, 4);
+      raw_reserve(0, reserve::INCREASE_BY_ORIGINAL_BALANCE);
     }
 
+    int forward_ton_amount = msg_value - fee::jetton_transfer;
+
     send_asset_ext(
-      liquidator_address, query_id,
+      custom_payload_recipient, query_id,
       jw_address_hash, collateral_reward,
       forward_ton_amount,
       pack_liquidation_success_report_message(
@@ -395,29 +441,21 @@ cell liquidate_ton(
         collateral_reward,
         custom_response_payload
       ),
-      sendmode::CARRY_ALL_BALANCE
+      sendmode::CARRY_ALL_BALANCE ;;+ raw_reserve / we need mode 128 because we have two txs here
     );
 
     master::storage::save(
       meta, upgrade_config,
       asset_config_collection,
       if_active, oracles_info, admin, tokens_keys, 
-      asset_dynamics_collection
+      asset_dynamics_collection, supervisor
     );
-    ;; return() is right after "if-else" block
   } else {
     ;; Not enough liquidity - revert
-    ;; ???? It strict rejects
-    ;; but *maybe* it should allow transactions where 
-    ;; collateral_liquidity >= min_collateral_amount
 
-    ;; Notify lending-user of fail
-    ;; So it can revert liquidation changes
-    ;; and unlock itself
-    int fail_message_fee =
-      modest_fwd_fee_estimation(fwd_fee) + fee::liquidate_fail;
+    int fail_message_fee = modest_fwd_fee_estimation(fwd_fee) + fee::liquidate_fail;
 
-    send_message_to_lending_wallet_by_address(
+    send_message_to_evaa_user_sc_by_address(
       null(), fail_message_fee, ;; state_init don't need
       user_version, null(), ;; null upgrade_info
       sender_address, pack_liquidate_fail_message(
@@ -425,32 +463,45 @@ cell liquidate_ton(
         transferred_asset_id,
         delta_loan_principal,
         collateral_asset_id,
-        delta_collateral_principal
+        delta_collateral_principal,
+        subaccount_id
       ),
       sendmode::REGULAR
     );
 
     msg_value -= fail_message_fee;
 
+    msg_value -= (modest_fwd_fee_estimation(fwd_fee) + fee::liquidate_satisfied
+                + get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
+
     if (transferred_asset_id == constants::ton_asset_id){
-      raw_reserve(my_balance - transferred_amount - msg_value, reserve::REGULAR);
+      raw_reserve(transferred_amount, reserve::INCREASE_BY_ORIGINAL_BALANCE | reserve::NEGATE_AMOUNT);
     } else {
-      raw_reserve(0, 4);
+      raw_reserve(0, reserve::INCREASE_BY_ORIGINAL_BALANCE);
     }
 
     ;; Refund asset
-    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(transferred_asset_id);
+    (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(transferred_asset_id);
+    if (custom_payload_saturation_flag) {
+      custom_response_payload = custom_response_payload.begin_parse().preload_ref(); ;; to get main custom payload than send a wrong data
+    }
+    
+    int forward_ton_amount = msg_value - fee::jetton_transfer;
+
     send_asset_ext(
       liquidator_address, query_id,
       jw_address_hash, transferred_amount,
       forward_ton_amount,
       pack_liquidation_fail_report_message(
         build_master_not_enough_liquidity_error(
+          query_id,
           collateral_liquidity
         ),
         custom_response_payload
       ),
-      sendmode::CARRY_ALL_BALANCE
+      sendmode::CARRY_ALL_BALANCE ;;+ raw_reserve / we need mode 128 because we have two txs here
     );
     ;; Once again (as with Liquidation Unsatisfied):
     ;; we don't need to check if enough of transferred_asset is available for refund - there HAS to be
@@ -469,7 +520,8 @@ cell liquidate_ton(
 
   var (
     _, liquidator_address, transferred_asset_id, delta_loan_principal, liquidatable_amount,
-    protocol_gift, _, collateral_asset_id, delta_collateral_principal, _, _, _, forward_ton_amount, custom_response_payload
+    protocol_gift, _, collateral_asset_id, delta_collateral_principal, _, _, _, custom_response_payload,
+    subaccount_id, custom_payload_recipient, custom_payload_saturation_flag
   ) = parse_liquidate_satisfied_message(in_msg_body);
 
   int user_version = upgrade_config.upgrade_config:user_code_version();
@@ -478,7 +530,7 @@ cell liquidate_ton(
 
   int transferred_amount = liquidatable_amount + protocol_gift;
 
-  send_message_to_lending_wallet_by_address(
+  send_message_to_evaa_user_sc_by_address(
     null(), fail_message_fee, ;; state_init don't need
     user_version, null(), ;; null upgrade_info
     sender_address, pack_liquidate_fail_message(
@@ -486,100 +538,262 @@ cell liquidate_ton(
       transferred_asset_id,
       delta_loan_principal,
       collateral_asset_id,
-      delta_collateral_principal
+      delta_collateral_principal,
+      subaccount_id
     ),
     sendmode::REGULAR
   );
 
   msg_value -= fail_message_fee;
 
+  msg_value -= (get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
+
   if (transferred_asset_id == constants::ton_asset_id){
-    raw_reserve(my_balance - transferred_amount - msg_value, reserve::REGULAR);
+    raw_reserve(transferred_amount, reserve::INCREASE_BY_ORIGINAL_BALANCE | reserve::NEGATE_AMOUNT);
   } else {
-    raw_reserve(0, 4);
+    raw_reserve(0, reserve::INCREASE_BY_ORIGINAL_BALANCE);
   }
 
   ;; Refund asset
-  (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _)
-    = asset_config_collection.asset_config_collection:get_unpacked(transferred_asset_id);
+  (int jw_address_hash, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _,
+    _, _, _, _) = asset_config_collection.asset_config_collection:get_unpacked(transferred_asset_id);
+
+  int forward_ton_amount = msg_value - fee::jetton_transfer;
 
   send_asset_ext(
     liquidator_address, query_id,
     jw_address_hash, transferred_amount,
     forward_ton_amount,
     pack_liquidation_fail_report_message(
-      build_execution_crashed_error(),
+      build_execution_crashed_error(query_id),
       custom_response_payload
     ),
-    sendmode::CARRY_ALL_BALANCE
+    sendmode::CARRY_ALL_BALANCE ;;+ raw_reserve / we need mode 128 because we have two txs here
   );
 }
 
-() liquidate_master_jetton_process  (
-  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
-  slice sender_address, int addr_hash, int fwd_fee, ;; in_msg_full params
-  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, slice admin, slice oracles_info, cell tokens_keys,  cell asset_dynamics_collection, ;; storage params
-  int jetton_op_code, int query_id, int jetton_amount, slice from_address, int user_version, cell user_code ;; jetton tx body params
+() liquidate_master_jetton_pyth_process(
+  int my_balance, int msg_value, slice evaa_operation_slice, ;; recv_internal params
+  slice master_jw_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor, ;; storage params
+  int query_id, int jetton_amount, slice initial_sender,
+  cell prices_packed, ;; dict: evaa_id=>[price: uint64, timestamp: uint64]
+  cell feeds_data, int prices_ttl
 ) impure inline {
-  (slice borrower_address, slice liquidator_address, int collateral_asset_id, int min_collateral_amount, _, int include_user_code, int forward_ton_amount, cell custom_response_payload, cell prices_packed) = parse_liquidate_master_message(in_msg_body);
-  (slice token_id, int found) = tokens_keys.udict_get?(256, addr_hash);
-
-  ifnot(is_valid_custom_response_payload?(custom_response_payload)) {
-    respond_send_jetton(
-      sender_address, from_address,
-      query_id, jetton_amount,
-      begin_cell().store_op_code(error::custom_response_payload_too_big).end_cell(), forward_ton_amount
-    );
-    return ();
+  (slice borrower_address, int collateral_asset_id, int min_collateral_amount, _, int include_user_code, cell requested_ref_tokens,
+    cell custom_response_payload, int subaccount_id, slice custom_payload_recipient, int custom_payload_saturation_flag) = parse_liquidate_master_message(evaa_operation_slice);
+  
+  if(custom_payload_recipient.null?()) {
+    custom_payload_recipient = initial_sender;
   }
 
-  int addresses_are_valid = is_valid_address?(borrower_address) & is_valid_address?(liquidator_address);
-  ifnot (addresses_are_valid) {
-    respond_send_jetton(
-      sender_address, from_address,
-      query_id, jetton_amount,
-      begin_cell().store_op_code(error::invalid_address_provided).store_ref(custom_response_payload).end_cell(), forward_ton_amount
+  slice custom_response_payload_open = custom_response_payload.begin_parse();
+  cell custom_response_payload_extended = custom_response_payload;
+
+  ifnot (custom_response_payload_open.slice_empty?()) {
+    custom_response_payload_extended = begin_cell()
+				.store_slice(initial_sender)
+				.store_ref(custom_response_payload)
+			.end_cell(); 
+  }
+  
+  try {
+    (slice token_id, _) = tokens_keys.udict_get?(256, addr_hash);
+    int transferred_asset_id = token_id~load_asset_id();
+  
+    int prices_not_valid = prices_packed~packed_price:parse_check(feeds_data, requested_ref_tokens, prices_ttl);
+
+    if (prices_not_valid) {
+      msg_value -= (modest_fwd_fee_estimation(fwd_fee)
+                  + fee::liquidate_master
+                  + get_compute_fee(constants::wc_master, gas_consumed())
+                  + fee::unfinished_runtime_gas
+                  + storage_fees());
+
+      int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+      respond_send_jetton(
+        master_jw_address, initial_sender,
+        query_id, jetton_amount,
+        begin_cell().store_op_code(prices_not_valid).store_query_id(query_id).store_ref(custom_response_payload_extended).end_cell(), forward_ton_amount
+      );
+      return ();
+    }
+
+    ( _, int user_version, _, _, _, cell user_code, _, _) = upgrade_config.unpack_upgrade_config();
+
+    asset_dynamics_collection = liquidate_jetton(
+      user_version, include_user_code ? user_code : null(), query_id,
+      asset_config_collection, asset_dynamics_collection,
+      msg_value, fwd_fee,
+      borrower_address,
+      collateral_asset_id, min_collateral_amount,
+      initial_sender,
+      transferred_asset_id, jetton_amount,
+      custom_response_payload_extended,
+      prices_packed,
+      subaccount_id, custom_payload_recipient, custom_payload_saturation_flag
     );
-    return ();
+
+    master::storage::save(
+      meta, upgrade_config,
+      asset_config_collection,
+      if_active, oracles_info, admin, tokens_keys,
+      asset_dynamics_collection, supervisor
+    );
+  } catch (_, error_code){
+    msg_value -= (modest_fwd_fee_estimation(fwd_fee)
+            + fee::liquidate_master
+            + get_compute_fee(constants::wc_master, gas_consumed())
+            + fee::unfinished_runtime_gas
+            + storage_fees());
+
+    int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+    respond_send_jetton(
+      master_jw_address, initial_sender,
+      query_id, jetton_amount,
+      begin_cell().store_op_code(error_code).store_query_id(query_id).store_ref(custom_response_payload_extended).end_cell(), forward_ton_amount
+    );
+  }
+  return ();
+}
+
+() liquidate_master_jetton_request (
+  int my_balance, int msg_value, cell in_msg_full, slice in_msg_body, ;; recv_internal params
+  slice master_jw_address, int addr_hash, int fwd_fee, ;; in_msg_full params
+  cell meta, cell upgrade_config, cell asset_config_collection, int if_active, cell oracles_info, slice admin, cell tokens_keys,  cell asset_dynamics_collection, slice supervisor, ;; storage params
+  int jetton_op_code, int query_id, int jetton_amount, slice initial_sender, int user_version, cell user_code ;; jetton tx body params
+) impure inline {
+  cell prices_data_args = in_msg_body~load_ref();
+  cell evaa_operation_cell = in_msg_body~load_ref();
+
+  (slice borrower_address, int collateral_asset_id, _, _, _, _, cell custom_response_payload, _, slice custom_payload_recipient, _
+  ) = parse_liquidate_master_message(evaa_operation_cell.begin_parse());
+
+  (cell prices_packed, cell target_feeds, int feeds_len, int min_publish_gap, int max_staleness) = unpack_prices_data_args(prices_data_args);
+
+  slice custom_response_payload_open = custom_response_payload.begin_parse();
+  cell custom_response_payload_extended = custom_response_payload;
+
+  ifnot (custom_response_payload_open.slice_empty?()) {
+    custom_response_payload_extended = begin_cell()
+				.store_slice(initial_sender)
+				.store_ref(custom_response_payload)
+			.end_cell(); 
   }
 
-  int prices_error_code = prices_packed~prices_packed:error(oracles_info);
-  if (prices_error_code) { ;; non-zero codes are errors
-    respond_send_jetton(
-      sender_address, from_address,
-      query_id, jetton_amount,
-      begin_cell().store_op_code(prices_error_code).store_ref(custom_response_payload).end_cell(), forward_ton_amount
-    );
-    return ();
-  }
-
+  (slice token_id, _) = tokens_keys.udict_get?(256, addr_hash);
   int transferred_asset_id = token_id~load_asset_id();
-  if (collateral_asset_id == transferred_asset_id) {
+
+  ;; check msg_value is enough for paying pyth fees
+  var (pyth_address, _, _, pyth_compute_base_gas, pyth_compute_per_update_gas, pyth_single_update_fee) = parse_oracles_info(oracles_info.begin_parse());
+  int required_fee = calculate_pyth_update_fee(pyth_compute_base_gas, pyth_compute_per_update_gas, pyth_single_update_fee,feeds_len);
+
+  int addresses_not_valid = ~ (is_valid_address?(borrower_address) & is_valid_address?(custom_payload_recipient));
+  int custom_payload_not_valid = ~ is_valid_custom_response_payload?(custom_response_payload);
+
+  (_, int is_collateral_asset_exist) = asset_config_collection.udict_get?(256, collateral_asset_id);
+
+  int data_not_valid = (collateral_asset_id == transferred_asset_id) | (~ is_collateral_asset_exist);
+  int fee_not_enough = msg_value < required_fee;
+
+  if (addresses_not_valid | custom_payload_not_valid | data_not_valid | fee_not_enough) {
+
+    msg_value -= (modest_fwd_fee_estimation(fwd_fee)
+                  + fee::liquidate_master
+                  + get_compute_fee(constants::wc_master, gas_consumed())
+                  + fee::unfinished_runtime_gas
+                  + storage_fees());
+
+    int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+    int error_code = addresses_not_valid ? error::invalid_address_provided :
+                      data_not_valid ? error::invalid_data :
+                      custom_payload_not_valid ? error::custom_response_payload_too_big :
+                      error::pyth_feeds_update_transaction_fees;
     respond_send_jetton(
-      sender_address, from_address,
+      master_jw_address, initial_sender,
       query_id, jetton_amount,
-      begin_cell().store_op_code(error::invalid_data).store_ref(custom_response_payload).end_cell(), forward_ton_amount
+      begin_cell().store_op_code(error_code).store_query_id(query_id).store_ref(custom_response_payload_extended).end_cell(), forward_ton_amount
     );
     return ();
   }
 
-  asset_dynamics_collection = liquidate_jetton(
-    user_version, include_user_code ? user_code : null(), query_id,
-    asset_config_collection, asset_dynamics_collection,
-    msg_value, fwd_fee,
-    borrower_address,
-    collateral_asset_id, min_collateral_amount,
-    liquidator_address, ;; address of whoever sent jettons - that's gonna be liquidator
-    transferred_asset_id, jetton_amount,
-    forward_ton_amount, custom_response_payload,
-    prices_packed
-  );
+  ;; pack payload and send to pyth
+  cell operation_body = begin_cell()
+    .store_ref(evaa_operation_cell)
+    .store_slice(master_jw_address)
+    .store_amount(jetton_amount)
+    .store_slice(initial_sender)
+    .end_cell();
+
+  cell operation_payload = begin_cell()
+    .store_op_code(op::liquidate_master_jetton_process)
+    .store_uint(query_id, 64)
+    .store_ref(operation_body)
+    .end_cell();
+
+  request_price_feeds(pyth_address, min_publish_gap, max_staleness, prices_packed, target_feeds, operation_payload);
 
   master::storage::save(
     meta, upgrade_config,
     asset_config_collection,
-    if_active, oracles_info, admin, tokens_keys, 
-    asset_dynamics_collection
+    if_active, oracles_info, admin, tokens_keys,
+    asset_dynamics_collection, supervisor
   );
   return ();
+}
+
+;; return jettons and ton excesses to sender
+() liquidate_handle_pyth_error_response(int query_id, int msg_value, int fwd_fee, int pyth_error_code, slice operation_body) impure inline {
+  ;; if we fail to unpack operation_body, should we report crash?
+  (slice evaa_operation_slice, slice master_jw_address, int addr_hash, int jetton_amount, slice initial_sender
+  ) = unpack_liquidate_master_jetton(operation_body);
+
+  (_, _, _, _, _, _, cell custom_response_payload, _, _, _) = parse_liquidate_master_message(evaa_operation_slice);
+  
+  slice custom_response_payload_open = custom_response_payload.begin_parse();
+  cell custom_response_payload_extended = custom_response_payload;
+  
+  ifnot (custom_response_payload_open.slice_empty?()) {
+    custom_response_payload_extended = begin_cell()
+				.store_slice(initial_sender)
+				.store_ref(custom_response_payload)
+			.end_cell(); 
+  }
+
+  msg_value -= (modest_fwd_fee_estimation(fwd_fee)
+                + fee::liquidate_master
+                + get_compute_fee(constants::wc_master, gas_consumed())
+                + fee::unfinished_runtime_gas
+                + storage_fees());
+
+  int forward_ton_amount = msg_value - fee::jetton_transfer;
+
+  send_asset_ext(initial_sender, query_id, addr_hash, jetton_amount, forward_ton_amount,
+    begin_cell()
+      .store_op_code(error::pyth_error_on_liquidate)
+      .store_op_code(pyth_error_code)
+      .store_ref(custom_response_payload_extended)
+      .end_cell(),
+    sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
+  );
+}
+
+
+() liquidate_master_ton_pyth_handle_exception(
+  slice sender_address, 
+  int query_id, int error_code, cell in_msg_full
+) impure inline {
+    send_message(
+        sender_address,
+        0,
+        begin_cell().store_op_code(error_code).store_query_id(query_id).store_ref(in_msg_full).end_cell(),
+        sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE
+    );
+
+    return ();
 }

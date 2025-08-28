@@ -1,6 +1,3 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "../external/stdlib.fc";
 #include "../external/ton.fc";
 #include "../data/basic-types.fc";
@@ -9,41 +6,49 @@
 
 ;; ---------- op::liquidate_master ----------
 
-(slice, slice, int, int, int, int, int, cell, cell) parse_liquidate_master_message(slice cs) {
-	slice borrower_address = cs~load_msg_addr(); ;;256
-	slice liquidator_address = cs~load_msg_addr(); ;;256
-	int collateral_asset_id = cs~load_asset_id(); ;;256
-	int min_collateral_amount = cs~load_amount(); ;;64
-	;; WARNING
-	;; It is important that min_collateral_amount ^ is stored as unsigned,
-	;; so it is always guaranteed to be non-negative (or that the code checks for its non-negativity)
-	;; Otherwise, it's possible to set min_collateral_amount to negative value
-	;; and try to do some sketchy stuff like "reverse-liquidation":
-	;; trying to liquidate positive (non-loan) position to increase both "collateral" and "loan" (which is, once again - non-loan)
-	;; (and "collateral" increases more because of liquidation bonus, so hacker gets net-positive)
-	;; The problem with this "hack" right now though, is that Master will be unable to send negative TONs or Jettons,
-	;; thus failing compute-phase and as part of it: also failing to send liquidation-subtract/unblock message:
-	;; in other words, the smart contract will be left forever in liquidation state.
-	;; So it will be impossible to just withdraw money from it.
-	;; "Anti-liquidation" can remove negative balances and turn them higher than zero,
-	;; but it's unclear how to hack from there without using Supply/Withdraw, only liquidation (which is allowed to proceed in parallel).
-	;; Regardless, anti-liquidation can permanently block/freeze any liquidatable User contract
-	;; and it's best to keep min_collateral_amount non-negative regardless of potential (yet not fully clear) money-stealing hack.
+
+(slice, int, int, int, int, cell, cell, int, slice, int) parse_liquidate_master_message(slice cs) {
+	slice borrower_address = cs~load_msg_addr(); 	;;256
+	int collateral_asset_id = cs~load_asset_id(); 	;;256
+	int min_collateral_amount = cs~load_amount(); 	;;64
 	int include_user_code = cs~load_bool_ext(); ;; bool
-	int liquidate_incoming_amount = cs~load_amount(); ;;64 
+	int liquidate_incoming_amount = cs~load_amount(); ;;64
+	cell requested_ref_tokens = cs~load_dict();
 	cell response_payload_packed = cs~load_ref();
 	slice response_payload_unpacked = response_payload_packed.begin_parse();
-	int forward_ton_amount = response_payload_unpacked~load_amount(); ;;64 
 	cell custom_response_payload = response_payload_unpacked~load_ref();
-	cell prices_with_signature_packed = cs~load_ref();
+
+	int subaccount_id = 0;
+	slice custom_payload_recipient = null();
+	int custom_payload_saturation_flag = false;
+	if (response_payload_unpacked.slice_bits() == (16 + 267 + 2)) {
+		subaccount_id = response_payload_unpacked~load_int(16);
+		custom_payload_recipient = response_payload_unpacked~load_msg_addr();
+		custom_payload_saturation_flag = response_payload_unpacked~load_bool_ext();
+	}
 	cs.end_parse();
+
 	return (
-		borrower_address, liquidator_address,
+		borrower_address, 
 		collateral_asset_id, min_collateral_amount,
 		liquidate_incoming_amount, include_user_code,
-		forward_ton_amount, 
-		custom_response_payload, prices_with_signature_packed
+		requested_ref_tokens,
+		custom_response_payload, 
+		subaccount_id, custom_payload_recipient, custom_payload_saturation_flag
 	);
+}
+
+(slice, slice, int, int, slice) unpack_liquidate_master_jetton(slice operation_payload) impure inline {
+	cell evaa_operation_cell = operation_payload~load_ref();
+	slice master_jw_address = operation_payload~load_msg_addr();
+	int jetton_amount = operation_payload~load_uint(64);
+	slice initial_sender = operation_payload~load_msg_addr();
+	operation_payload.end_parse();
+
+	var (_, addr_hash) = parse_std_addr(master_jw_address);
+	slice evaa_operation_slice = evaa_operation_cell.begin_parse();
+
+	return (evaa_operation_slice, master_jw_address, addr_hash, jetton_amount, initial_sender);
 }
 
 ;; ---------- op::liquidate_user ----------
@@ -54,96 +59,114 @@ cell pack_liquidate_user_message(
 	int collateral_asset_id, int min_collateral_amount,
 	slice liquidator_address,
 	int transferred_asset_id, int transfered_amount,
-	int forward_ton_amount, cell custom_response_payload,
-	cell prices_packed
+	cell custom_response_payload,
+	cell prices_packed,
+	int subaccount_id, 
+	slice custom_payload_recipient,
+	int custom_payload_saturation_flag
 ) {
 	return begin_cell()
 		.store_op_code(op::liquidate_user) ;; 32
 		.store_query_id(query_id) ;; 64
 		.store_dict(asset_config_collection) ;; 1 ^1
 		.store_dict(asset_dynamics_collection) ;; 1 ^1
-		.store_ref( ;; ^1
-			begin_cell()
+		.store_ref(begin_cell()
 			.store_ref(prices_packed) ;; ^1
 			.store_asset_id(collateral_asset_id) ;; 256
 			.store_amount(min_collateral_amount) ;; 64
 			.store_slice(liquidator_address) ;; 256
 			.store_asset_id(transferred_asset_id) ;; 256
 			.store_amount(transfered_amount) ;; 64
-			.store_amount(forward_ton_amount) ;; 64
 			.store_ref(custom_response_payload) ;; ^1
-			.end_cell()
-		)
+			.store_int(subaccount_id, 16)
+			.store_ref(begin_cell()
+					  .store_slice(custom_payload_recipient)
+					  .store_int(custom_payload_saturation_flag, 2) ;; 2
+					  .end_cell())
+			.end_cell())
 		.end_cell();
 }
 
-(cell, cell, cell, int, int, slice, int, int, int, cell) parse_liquidate_user_message(slice cs) {
+(cell, cell, cell, int, int, slice, int, int, cell, int, slice, int) parse_liquidate_user_message(slice cs) {
 	cell asset_config_collection = cs~load_dict();
 	cell asset_dynamics_collection = cs~load_dict();
 	cs = cs.preload_ref().begin_parse();
 	cell prices_packed = cs~load_ref();
 	int collateral_asset_id = cs~load_asset_id();
 	int min_collateral_amount = cs~load_amount();
-	;; cs = cs.preload_ref().begin_parse();
 	slice liquidator_address = cs~load_msg_addr();
 	int transferred_asset_id = cs~load_asset_id();
 	int transfered_amount = cs~load_amount();
-	int forward_ton_amount = cs~load_amount();
 	cell custom_response_payload = cs~load_ref();
+	int subaccount_id = cs~load_int(16);
+	cs = cs.preload_ref().begin_parse();
+	slice custom_payload_recipient = cs~load_msg_addr();
+	int custom_payload_saturation_flag = cs~load_bool_ext();
 	return (
 		asset_config_collection, asset_dynamics_collection, prices_packed,
 		collateral_asset_id, min_collateral_amount,
 		liquidator_address,
 		transferred_asset_id, transfered_amount,
-		forward_ton_amount, custom_response_payload
+		custom_response_payload,
+		subaccount_id,
+		custom_payload_recipient, custom_payload_saturation_flag
 	);
 }
 
 ;; ---------- Liquidate unsatisfied errors ----------
 
-builder build_master_liquidating_too_much_error(int max_allowed_liquidation) {
+builder build_master_liquidating_too_much_error(int query_id, int max_allowed_liquidation) {
 	return begin_cell()
 		.store_op_code(error::master_liquidating_too_much)
+		.store_query_id(query_id)
 		.store_amount(max_allowed_liquidation);
 }
-builder build_user_withdraw_in_progress_error() {
+builder build_user_withdraw_in_progress_error(int query_id) {
 	return begin_cell()
-		.store_op_code(error::user_withdraw_in_progress);
+		.store_op_code(error::user_withdraw_in_progress)
+		.store_query_id(query_id);
 }
-builder build_not_liquidatable_error() {
+builder build_not_liquidatable_error(int query_id) {
 	return begin_cell()
-		.store_op_code(error::not_liquidatable);
+		.store_op_code(error::not_liquidatable)
+		.store_query_id(query_id);
 }
-builder build_execution_crashed_error() {
+builder build_execution_crashed_error(int query_id) {
 	return begin_cell()
-		.store_op_code(error::liqudation_execution_crashed);
+		.store_op_code(error::liquidation_execution_crashed)
+		.store_query_id(query_id);
 }
-builder build_min_collateral_not_satisfied_error(int collateral_amount) {
+builder build_min_collateral_not_satisfied_error(int query_id, int collateral_amount) {
 	if (collateral_amount < 0) {
 		collateral_amount = 0;
 	}
 	return begin_cell()
 		.store_op_code(error::min_collateral_not_satisfied)
+		.store_query_id(query_id)
 		.store_amount(collateral_amount);
 }
-builder build_user_not_enough_collateral_error(int collateral_present) {
+builder build_user_not_enough_collateral_error(int query_id, int collateral_present) {
 	return begin_cell()
 		.store_op_code(error::user_not_enough_collateral)
+		.store_query_id(query_id)
 		.store_amount(collateral_present);
 }
-builder build_user_liquidating_too_much_error(int max_not_too_much) {
+builder build_user_liquidating_too_much_error(int query_id, int max_not_too_much) {
 	return begin_cell()
 		.store_op_code(error::user_liquidating_too_much)
+		.store_query_id(query_id)
 		.store_amount(max_not_too_much);
 }
-builder build_master_not_enough_liquidity_error(int available_liquidity) {
+builder build_master_not_enough_liquidity_error(int query_id, int available_liquidity) {
 	return begin_cell()
 		.store_op_code(error::master_not_enough_liquidity)
+		.store_query_id(query_id)
 		.store_amount(available_liquidity);
 }
-builder build_liquidation_prices_missing() {
+builder build_liquidation_prices_missing(int query_id) {
 	return begin_cell()
-		.store_op_code(error::liquidation_prices_missing);
+		.store_op_code(error::liquidation_prices_missing)
+		.store_query_id(query_id);
 }
 
 ;; ---------- op::liquidate_unsatisfied ----------
@@ -153,7 +176,8 @@ cell pack_liquidate_unsatisfied_message(
 	slice liquidator_address,
 	int transferred_asset_id, int transfered_amount,
 	int collateral_asset_id, int min_collateral_amount,
-	int forward_ton_amount, cell custom_response_payload,
+	cell custom_response_payload,
+	int subaccount_id,
 	builder error
 ) {
 	return begin_cell()
@@ -162,21 +186,20 @@ cell pack_liquidate_unsatisfied_message(
 		.store_slice(owner_address)
 		.store_slice(liquidator_address)
 		.store_asset_id(transferred_asset_id)
-		;; Store some part in the reference, it wouldn't fit otherwise. The storage layout is quite arbitrary though
 		.store_ref(
-			begin_cell()
+		begin_cell()
 			.store_amount(transfered_amount)
 			.store_asset_id(collateral_asset_id)
 			.store_amount(min_collateral_amount)
-			.store_amount(forward_ton_amount)
 			.store_ref(custom_response_payload)
+			.store_int(subaccount_id, 16)
 			.store_builder(error)
 			.end_cell()
-		)
+	)
 		.end_cell();
 }
 
-(slice, slice, int, int, int, int, int, cell, slice) parse_liquidate_unsatisfied_message(slice cs) {
+(slice, slice, int, int, int, int, cell, int, slice) parse_liquidate_unsatisfied_message(slice cs) {
 	slice owner_address = cs~load_msg_addr();
 	slice liquidator_address = cs~load_msg_addr();
 	int transferred_asset_id = cs~load_asset_id();
@@ -184,15 +207,16 @@ cell pack_liquidate_unsatisfied_message(
 	int transfered_amount = cs~load_amount();
 	int collateral_asset_id = cs~load_asset_id();
 	int min_collateral_amount = cs~load_amount();
-	int forward_ton_amount = cs~load_amount();
 	cell custom_response_payload = cs~load_ref();
+	int subaccount_id = cs~load_int(16);
 	slice error = cs;
 	return (
 		owner_address,
 		liquidator_address,
 		transferred_asset_id, transfered_amount,
 		collateral_asset_id, min_collateral_amount,
-		forward_ton_amount, custom_response_payload,
+		custom_response_payload,
+		subaccount_id,
 		error
 	);
 }
@@ -208,7 +232,10 @@ cell pack_liquidate_satisfied_message(
 	int collateral_asset_id,
 	int delta_collateral_principal, int collateral_reward, int min_collateral_amount,
 	int new_user_collateral_principal,
-	int forward_ton_amount, cell custom_response_payload
+	cell custom_response_payload,
+	int subaccount_id,
+	slice custom_payload_recipient,
+	int custom_payload_saturation_flag
 ) {
 	return begin_cell()
 		.store_op_code(op::liquidate_satisfied)
@@ -216,9 +243,8 @@ cell pack_liquidate_satisfied_message(
 		.store_slice(owner_address)
 		.store_slice(liquidator_address)
 		.store_asset_id(transferred_asset_id)
-		;; Store some part in the reference, it wouldn't fit otherwise. The storage layout is quite arbitrary though
 		.store_ref(
-			begin_cell()
+		begin_cell()
 			.store_principal(delta_loan_principal) ;; 64
 			.store_amount(liquidatable_amount) ;; 64
 			.store_amount(protocol_gift) ;; 64
@@ -228,30 +254,38 @@ cell pack_liquidate_satisfied_message(
 			.store_amount(collateral_reward) ;; 64
 			.store_amount(min_collateral_amount) ;; 64
 			.store_principal(new_user_collateral_principal) ;; 64
-			.store_amount(forward_ton_amount) ;; 64
 			.store_ref(custom_response_payload)
+			.store_int(subaccount_id, 16)
+			.store_ref(begin_cell()
+					  .store_slice(custom_payload_recipient) ;; 267
+					  .store_int(custom_payload_saturation_flag, 2) ;; 2
+					  .end_cell())
 			.end_cell()
-		)
+	)
 		.end_cell();
 }
 
-(slice, slice, int, int, int, int, int, int, int, int, int, int, int, cell) parse_liquidate_satisfied_message(slice cs) {
+(slice, slice, int, int, int, int, int, int, int, int, int, int, cell, int, slice, int) parse_liquidate_satisfied_message(slice cs) {
 	slice owner_address = cs~load_msg_addr();
 	slice liquidator_address = cs~load_msg_addr();
 	int transferred_asset_id = cs~load_asset_id();
-	cs = cs.preload_ref().begin_parse();
-	int delta_loan_principal = cs~load_principal();
-	int liquidatable_amount = cs~load_amount();
-	int protocol_gift = cs~load_amount();
-	int new_user_loan_principal = cs~load_principal();
 
-	int collateral_asset_id = cs~load_asset_id();
-	int delta_collateral_principal = cs~load_principal();
-	int collateral_reward = cs~load_amount();
-	int min_collateral_amount = cs~load_amount();
-	int new_user_collateral_principal = cs~load_principal();
-	int forward_ton_amount = cs~load_amount();
-	cell custom_response_payload = cs~load_ref();
+	slice cs1 = cs~load_ref().begin_parse();
+	int delta_loan_principal = cs1~load_principal();
+	int liquidatable_amount = cs1~load_amount();
+	int protocol_gift = cs1~load_amount();
+	int new_user_loan_principal = cs1~load_principal();
+	int collateral_asset_id = cs1~load_asset_id();
+	int delta_collateral_principal = cs1~load_principal();
+	int collateral_reward = cs1~load_amount();
+	int min_collateral_amount = cs1~load_amount();
+	int new_user_collateral_principal = cs1~load_principal();
+	cell custom_response_payload = cs1~load_ref();
+	int subaccount_id = cs1~load_int(16);
+	
+	slice cs2 = cs1~load_ref().begin_parse();
+	slice custom_payload_recipient = cs2~load_msg_addr();
+	int custom_payload_saturation_flag = cs2~load_bool_ext();
 	
 	return (
 		owner_address, liquidator_address,
@@ -261,7 +295,9 @@ cell pack_liquidate_satisfied_message(
 		collateral_asset_id,
 		delta_collateral_principal, collateral_reward, min_collateral_amount,
 		new_user_collateral_principal, 
-		forward_ton_amount, custom_response_payload
+		custom_response_payload,
+		subaccount_id,
+		custom_payload_recipient, custom_payload_saturation_flag
 	);
 }
 
@@ -274,31 +310,45 @@ builder pack_liquidate_success_message(
 	int loan_tracking_supply_index, int loan_tracking_borrow_index,
 	int collateral_asset_id,
 	int delta_collateral_principal,
-	int collateral_tracking_supply_index, int collateral_tracking_borrow_index
+	int collateral_tracking_supply_index, int collateral_tracking_borrow_index,
+	int subaccount_id
 ) {
-	return begin_cell()
-		.store_op_code(op::liquidate_success)
-		.store_query_id(query_id)
-		.store_asset_id(transferred_asset_id)
-		.store_principal(delta_loan_principal)
-		.store_tracking_index(loan_tracking_supply_index)
-		.store_tracking_index(loan_tracking_borrow_index)
-		.store_asset_id(collateral_asset_id)
-		.store_principal(delta_collateral_principal)
-		.store_tracking_index(collateral_tracking_supply_index)
-		.store_tracking_index(collateral_tracking_borrow_index);
+	builder res = begin_cell()
+		.store_op_code(op::liquidate_success) ;; 32
+		.store_query_id(query_id) ;; 64
+		.store_asset_id(transferred_asset_id) ;; 256
+		.store_principal(delta_loan_principal) ;; 64
+		.store_tracking_index(loan_tracking_supply_index) ;; 64
+		.store_tracking_index(loan_tracking_borrow_index) ;; 64
+		.store_asset_id(collateral_asset_id) ;; 256
+		.store_principal(delta_collateral_principal) ;; 64
+		.store_tracking_index(collateral_tracking_supply_index) ;; 64
+		.store_tracking_index(collateral_tracking_borrow_index) ;; 64
+		.store_int(subaccount_id, 16);
+	return res;
 }
 
-(int, int, int, int, int, int, int, int) parse_liquidate_success_message(slice cs) {
+(int, int, int, int, int, int, int, int, int) parse_liquidate_success_message(slice cs) {
+	int transferred_asset_id = cs~load_asset_id();
+	int delta_loan_principal = cs~load_principal();
+	int loan_tracking_supply_index = cs~load_tracking_index();
+	int loan_tracking_borrow_index = cs~load_tracking_index();
+	int collateral_asset_id = cs~load_asset_id();
+	int delta_collateral_principal = cs~load_principal();
+	int collateral_tracking_supply_index = cs~load_tracking_index();
+	int collateral_tracking_borrow_index = cs~load_tracking_index();
+	int subaccount_id = cs~load_int(16);
+
 	return (
-		cs~load_asset_id(),
-		cs~load_principal(),
-		cs~load_tracking_index(),
-		cs~load_tracking_index(),
-		cs~load_asset_id(),
-		cs~load_principal(),
-		cs~load_tracking_index(),
-		cs~load_tracking_index()
+		transferred_asset_id,
+		delta_loan_principal,
+		loan_tracking_supply_index,
+		loan_tracking_borrow_index,
+		collateral_asset_id,
+		delta_collateral_principal,
+		collateral_tracking_supply_index,
+		collateral_tracking_borrow_index,
+		subaccount_id
 	);
 }
 
@@ -309,7 +359,8 @@ builder pack_liquidate_fail_message(
 	int transferred_asset_id,
 	int delta_loan_principal,
 	int collateral_asset_id,
-	int delta_collateral_principal
+	int delta_collateral_principal,
+	int subaccount_id
 ) {
 	return begin_cell()
 		.store_op_code(op::liquidate_fail)
@@ -317,15 +368,17 @@ builder pack_liquidate_fail_message(
 		.store_asset_id(transferred_asset_id)
 		.store_principal(delta_loan_principal)
 		.store_asset_id(collateral_asset_id)
-		.store_principal(delta_collateral_principal);
+		.store_principal(delta_collateral_principal)
+		.store_int(subaccount_id, 16);
 }
 
-(int, int, int, int) parse_liquidate_fail_message(slice cs) {
+(int, int, int, int, int) parse_liquidate_fail_message(slice cs) {
 	return (
 		cs~load_asset_id(),
 		cs~load_principal(),
 		cs~load_asset_id(),
-		cs~load_principal()
+		cs~load_principal(),
+		cs~load_int(16)
 	);
 }
 
@@ -358,9 +411,29 @@ cell pack_liquidation_success_report_message(
 		.end_cell();
 }
 
-cell pack_liquidate_excess_message(int op, int query_id) {
+cell pack_liquidate_excess_message() {
 	return begin_cell()
 		.store_op_code(0)
 		.store_slice("EVAA liquidation.")
 		.end_cell();
+}
+
+cell pack_liquidate_fail_excess_message() {
+	return begin_cell()
+		.store_op_code(0)
+		.store_slice("EVAA liquidation fail.")
+		.end_cell();
+}
+
+(cell, cell, int, int, int) unpack_prices_data_args(cell prices_data) impure inline {
+	slice prices_slice = prices_data.begin_parse();
+	cell prices_data = prices_slice~load_ref();
+	cell target_feeds = prices_slice~load_ref();
+	int min_publish_gap = prices_slice~load_uint(64);
+	int max_staleness = prices_slice~load_uint(64);
+
+	int feeds_len = target_feeds.begin_parse().preload_uint(8);
+	prices_slice.end_parse();
+
+	return (prices_data, target_feeds, feeds_len, min_publish_gap, max_staleness);
 }

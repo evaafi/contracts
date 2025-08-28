@@ -1,9 +1,68 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "../external/ton.fc";
 #include "../data/basic-types.fc";
 #include "../constants/op-codes.fc";
+
+;; op::supply ton on master
+(int, int, slice, cell, int, int, slice, int) parse_master_supply_ton_message(slice cs) {
+	int include_user_code = cs~load_bool_ext(); 
+	int supply_amount = cs~load_amount();
+	slice recipient_address = cs~load_msg_addr();
+	cell custom_response_payload = cs~load_ref();
+
+	int subaccount_id = 0;
+	int return_repay_remainings_flag = false;
+	slice custom_payload_recipient = null();
+	int custom_payload_saturation_flag = false;
+	if (cs.slice_bits() == (16 + 2 + 267 + 2)) {
+		subaccount_id = cs~load_int(16);
+		return_repay_remainings_flag = cs~load_bool_ext();
+		custom_payload_recipient = cs~load_msg_addr();
+		custom_payload_saturation_flag = cs~load_bool_ext();
+	}
+
+	cs.end_parse();
+
+	return (
+		include_user_code,
+		supply_amount,
+		recipient_address,
+		custom_response_payload,
+		subaccount_id,
+		return_repay_remainings_flag,
+		custom_payload_recipient,
+		custom_payload_saturation_flag
+	);
+}
+
+;; op::supply jetton on master
+(int, slice, cell, int, int, slice, int) parse_master_supply_jetton_message(slice cs) {
+	int include_user_code = cs~load_bool_ext(); 
+	slice recipient_address = cs~load_msg_addr();
+	cell custom_response_payload = cs~load_ref();
+
+	int subaccount_id = 0;
+	int return_repay_remainings_flag = false;
+	slice custom_payload_recipient = null();
+	int custom_payload_saturation_flag = false;
+	if (cs.slice_bits() == (16 + 2 + 267 + 2)) {
+		subaccount_id = cs~load_int(16);
+		return_repay_remainings_flag = cs~load_bool_ext();
+		custom_payload_recipient = cs~load_msg_addr();
+		custom_payload_saturation_flag = cs~load_bool_ext();
+	}
+	
+	cs.end_parse();
+
+	return (
+		include_user_code,
+		recipient_address,
+		custom_response_payload,
+		subaccount_id,
+		return_repay_remainings_flag,
+		custom_payload_recipient,
+		custom_payload_saturation_flag
+	);
+}
 
 ;; --------------- op::supply_user ---------------
 ;; Supply request message
@@ -14,40 +73,75 @@ cell pack_supply_user_message(
 	int dust, int max_token_amount,
 	int total_supply, int total_borrow,
 	int tracking_supply_index, int tracking_borrow_index,
-	int forward_ton_amount, cell custom_response_payload
+	cell custom_response_payload,
+	int subaccount_id,
+	int return_repay_remainings_flag,
+	slice custom_payload_recipient,
+	int custom_payload_saturation_flag,
+	slice initial_sender
 ) {
 	return begin_cell()
 		.store_op_code(op::supply_user) ;; 32
-		.store_query_id(query_id) ;; 64
+		.store_query_id(query_id) ;; 64 
 		.store_asset_id(asset_id) ;; 256
 		.store_amount(supply_amount_current) ;; 64
 		.store_sb_rate(s_rate) ;; 64
 		.store_sb_rate(b_rate) ;; 64
-		.store_uint(dust, 64)
-		.store_uint(max_token_amount, 64)
+		.store_uint(dust, 64) ;; 64
+		.store_uint(max_token_amount, 64) ;; 64
 		.store_principal(total_supply) ;; 64
 		.store_principal(total_borrow) ;; 64
-		.store_tracking_index(tracking_supply_index)
-		.store_tracking_index(tracking_borrow_index)
-		.store_amount(forward_ton_amount) ;; 64
-		.store_ref(custom_response_payload)
+		.store_tracking_index(tracking_supply_index) ;; 64
+		.store_tracking_index(tracking_borrow_index) ;; 64
+		.store_ref(custom_response_payload) ;; ^1
+		.store_ref(begin_cell() ;; ^1
+			.store_int(subaccount_id, 16) ;; 16
+			.store_int(return_repay_remainings_flag, 2) ;; 2
+			.store_slice(custom_payload_recipient)
+			.store_int(custom_payload_saturation_flag, 2) ;; 2
+			.store_slice(initial_sender)
+			.end_cell())
 		.end_cell();
 }
 
-(int, int, int, int, int, int, int, int, int, int, int, cell) parse_supply_user_message(slice cs) {
+(int, int, int, int, int, int, int, int, int, int, cell, int, int, slice, int, slice) parse_supply_user_message(slice cs) {
+	int asset_id = cs~load_asset_id();
+	int supply_amount_current = cs~load_amount();
+	int s_rate = cs~load_sb_rate();
+	int b_rate = cs~load_sb_rate();
+	int dust = cs~load_uint(64);
+	int max_token_amount = cs~load_uint(64);
+	int total_supply = cs~load_principal();
+	int total_borrow = cs~load_principal();
+	int tracking_supply_index = cs~load_tracking_index();
+	int tracking_borrow_index = cs~load_tracking_index();
+	cell custom_response_payload = cs~load_ref();
+
+	cs = cs.preload_ref().begin_parse();
+	int subaccount_id = cs~load_int(16);
+	int return_repay_remainings_flag = cs~load_bool_ext();
+
+	slice custom_payload_recipient = cs~load_msg_addr();
+	int custom_payload_saturation_flag = cs~load_bool_ext();
+	slice initial_sender = cs~load_msg_addr();
+	
 	return (
-		cs~load_asset_id(),
-		cs~load_amount(),
-		cs~load_sb_rate(),
-		cs~load_sb_rate(),
-		cs~load_uint(64),
-		cs~load_uint(64),
-		cs~load_principal(),
-		cs~load_principal(),
-		cs~load_tracking_index(),
-		cs~load_tracking_index(),
-		cs~load_amount(),
-		cs~load_ref()
+		asset_id,
+		supply_amount_current,
+		s_rate,
+		b_rate,
+		dust,
+		max_token_amount,
+		total_supply,
+		total_borrow,
+		tracking_supply_index,
+		tracking_borrow_index,
+		custom_response_payload,
+		subaccount_id,
+		return_repay_remainings_flag,
+		custom_payload_recipient,
+		custom_payload_saturation_flag,
+		initial_sender
 	);
 }
 
@@ -56,22 +150,29 @@ cell pack_supply_user_message(
 cell pack_supply_success_message(
 	int query_id, slice owner_address,
 	int asset_id, int amount_supplied, int user_new_principal,
-	int repay_amount_principal, int supply_amount_principal, cell custom_response_payload
+	int repay_amount_principal, int supply_amount_principal,
+	cell custom_response_payload, int subaccount_id, int return_repay_remainings_flag, slice custom_payload_recipient, int custom_payload_saturation_flag
 ) {
 	return begin_cell()
 		.store_op_code(op::supply_success);; 32
 		.store_query_id(query_id) ;; 64
 		.store_slice(owner_address) ;; 256
 		.store_asset_id(asset_id) ;; 256
-		.store_amount(amount_supplied);; 64
-		.store_principal(user_new_principal);; 64
-		.store_principal(repay_amount_principal);; 64
-		.store_principal(supply_amount_principal)	;; 64
+		.store_amount(amount_supplied) ;; 64
+		.store_principal(user_new_principal) ;; 64
+		.store_principal(repay_amount_principal) ;; 64
+		.store_principal(supply_amount_principal) ;; 64
 		.store_ref(custom_response_payload)
+		.store_int(subaccount_id, 16)
+		.store_int(return_repay_remainings_flag, 2) ;; 2
+		.store_ref(begin_cell()
+				  .store_slice(custom_payload_recipient)
+				  .end_cell()) ;; ^1
+		.store_int(custom_payload_saturation_flag, 2) ;; 2
 		.end_cell();
 }
 
-(slice, int, int, int, int, int, cell) parse_supply_success_message(slice cs) {
+(slice, int, int, int, int, int, cell, int, int, slice, int) parse_supply_success_message(slice cs) {
 	return (
 		cs~load_msg_addr(), ;; owner_address
 		cs~load_asset_id(),
@@ -79,14 +180,20 @@ cell pack_supply_success_message(
 		cs~load_principal(),
 		cs~load_principal(),
 		cs~load_principal(),
-		cs~load_ref()
+		cs~load_ref(),
+		cs~load_int(16),
+		cs~load_bool_ext(),
+		cs~load_ref().begin_parse(),
+		cs~load_bool_ext()
 	);
 }
 
 ;; --------------- op::supply_fail ---------------
 cell pack_supply_fail_message(
 	int query_id, slice owner_address,
-	int asset_id, int amount, int forward_ton_amount, cell custom_response_payload
+	int asset_id, int amount,
+	cell custom_response_payload,
+	int subaccount_id, int return_repay_remainings_flag, slice initial_sender
 ) {
 	return begin_cell()
 		.store_op_code(op::supply_fail)
@@ -94,18 +201,24 @@ cell pack_supply_fail_message(
 		.store_slice(owner_address)
 		.store_asset_id(asset_id)
 		.store_amount(amount)
-		.store_amount(forward_ton_amount)
 		.store_ref(custom_response_payload)
+		.store_int(subaccount_id, 16)
+		.store_int(return_repay_remainings_flag, 2)
+		.store_ref(begin_cell()
+					.store_slice(initial_sender)
+					.end_cell())
 		.end_cell();
 }
 
-(slice, int, int, int, cell) parse_supply_fail_message(slice cs) {
+(slice, int, int, cell, int, int, slice) parse_supply_fail_message(slice cs) {
 	return (
 		cs~load_msg_addr(),
 		cs~load_asset_id(),
 		cs~load_amount(),
-		cs~load_amount(),
-		cs~load_ref()
+		cs~load_ref(), 
+		cs~load_int(16),
+		cs~load_bool_ext(),
+		cs~load_ref().begin_parse()
 	);
 }
 
@@ -131,5 +244,20 @@ cell pack_supply_success_excess_message() {
 	return begin_cell()
 		.store_op_code(0)
 		.store_slice("EVAA supply.")
+		.end_cell();
+}
+
+cell pack_supply_success_and_repay_remainings_message() {
+	return begin_cell()
+		.store_op_code(0)
+		.store_slice("EVAA supply and Return Repay Remainings.")
+		.end_cell();
+}
+
+cell pack_supply_excess_and_repay_remainings_message_with_data(int query_id, cell custom_response_payload) {
+	return begin_cell()
+		.store_op_code(op::supply_success_and_repay_remainings)
+		.store_query_id(query_id)
+		.store_ref(custom_response_payload)
 		.end_cell();
 }

@@ -1,21 +1,15 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "../external/stdlib.fc";
 
 {-
   user_principals = Dict
-    slice(256) jetton_address -> int(64) value
+    slice(256) jetton_address -> int(64) principal, ?int(64) origination_fee_taken_in_principal, ?uint(32) last_borrow_timestamp, ?uint(64) last_borrow_b_rate, 
 
   user_rewards = Dict
     slice(256) jetton_address -> int(64) tracking_index, int(64) tracking_accrued
 -}
 
-;; note move all global constants to one file
-;; Added to ^: nns2009: I'd say it makes sense to keep constants at their logical destination
-;; in this case here
 const user_state::free = 0; ;; Fully unlocked state
-const user_state::withdrawing = - (2 << 50); ;; "Big" negative number - big enough such that in case of some theoretical weird subtraction-by-one errors, this number can't be reached regardless
+const user_state::doing_supply_withdraw = - (2 << 50) + 1; ;; "Big" negative number - big enough such that in case of some theoretical weird subtraction-by-one errors, this number can't be reached regardless
 
 cell user::storage::pack_init(
   int user_version,
@@ -76,21 +70,6 @@ cell user::storage::pack(
   cell user_rewards = ds~load_dict();
   cell backup_cell_1 = ds~load_maybe_ref();
   cell backup_cell_2 = ds~load_maybe_ref();
-  
-  ;; note
-  ;; we cant add ds.end_parse() here because there is some amount of 0000 left in the store data if we just upgraded code version from < v6
-
-  ;; 34/ all of our user sc-s have code version >= 2, so there is 64 + 64 + 32 zeros and one REF after state variable in the store of all of the user sc-s
-  ;; so, in new version (v6) we will have in user load function
-  ;; cell user_rewards = ds~load_dict();
-  ;; cell backup_cell_1 = ds~load_maybe_ref();
-  ;; cell backup_cell_2 = ds~load_maybe_ref();
-  ;; that will load 3 nulls (when you have …000000000… and etc in the store, load_ref() from …00000000… will return null)
-  ;; so, in upgrade logic we will not change the storage, but on the firs sc invocation after upgrade store will re-write itself with 
-  ;; .store_dict(user_rewards)
-  ;; .store_maybe_ref(backup_cell_1)
-  ;; .store_maybe_ref(backup_cell_2)
-
   return (code_version, master_address, owner_address, user_principals, state, user_rewards, backup_cell_1, backup_cell_2);
 }
 

@@ -1,0 +1,2 @@
+const int op::pyth_response_error = 0x10002;
+const int op::pyth_parse_price_feed_updates = 5;

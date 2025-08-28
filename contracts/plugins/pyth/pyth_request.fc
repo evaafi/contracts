@@ -1,0 +1,58 @@
+#include "op_codes.fc";
+#include "stdlib.fc";
+
+int calculate_pyth_update_fee(int compute_base_gas, int compute_per_update_gas, int single_update_fee, int feeds_len) impure inline {
+    int commission = single_update_fee * feeds_len;
+    int compute_gas_estimate = compute_base_gas + feeds_len * compute_per_update_gas;
+    int compute_fee = get_compute_fee(0, compute_gas_estimate);
+    return commission + compute_fee;
+}
+
+(int, int, cell) parse_pyth_response_error(slice s) impure {
+    int error_code = s~load_uint(32);
+    int operation_code = s~load_uint(32);
+    cell custom_payload = s~load_ref();
+    s.end_parse();
+    return (error_code, operation_code, custom_payload);
+}
+
+(int, int, slice) parse_operation_payload(cell custom_payload) impure inline {
+    slice s = custom_payload.begin_parse();
+    int op_code = s~load_uint(32);
+    int query_id = s~load_query_id();
+    cell operation_payload = s~load_ref();
+    s.end_parse();
+    return (op_code, query_id, operation_payload.begin_parse());
+}
+
+;; this function only required for jetton onchain-getter operation
+;; composes pyth prices validation request message
+() request_price_feeds(
+    slice pyth_address,
+    int publish_gap,
+    int max_staleness,
+    cell price_update_data, ;; pyth price update data
+    cell target_pyth_feeds, ;; required pyth price ids
+    cell operation_payload  ;; custom payload to forward from pyth
+) impure {
+
+    ;; create prices request message to pyth contract
+    int min_publish_time = now() - publish_gap;
+    int max_publish_time = now() + max_staleness;
+
+    cell msg = begin_cell()
+        .store_uint(0x18, 6)                                        ;; nobounce
+        .store_slice(pyth_address)                                      ;; pyth contract address
+        .store_coins(0)                                                 ;; forward amount minus fees
+        .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)                 ;; default message headers
+        .store_uint(op::pyth_parse_price_feed_updates, 32)          ;; pyth opcode
+        .store_ref(price_update_data)                                   ;; update data
+        .store_ref(target_pyth_feeds)                                   ;; price feed IDs
+        .store_uint(min_publish_time, 64)                           ;; min_publish_time
+        .store_uint(max_publish_time, 64)                           ;; max_publush_time
+        .store_slice(my_address())                                      ;; target address (this contract)
+        .store_ref(operation_payload)                                   ;; packed operation payload
+        .end_cell();
+
+    send_raw_message(msg, sendmode::CARRY_ALL_REMAINING_MESSAGE_VALUE);
+}

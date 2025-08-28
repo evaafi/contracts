@@ -1,6 +1,3 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "../external/stdlib.fc";
 #include "../external/ton.fc";
 #include "../storage/user-storage.fc";
@@ -45,33 +42,29 @@ slice calc_master_wallet_address_from_asset_id(int asset_id, cell token_keys) in
 	}
 	return null();
 }
-;; NOTE: !!! Why is it called platform_address instead of master_address?
 
-;; type_id is in case we need other upgradeable group of contracts
-;; (beyond Users)
-;; the Blank functionality is intended to be universal
-;; it should be possible to reuse it later for whatever comes up
-;; But different groups of contracts should have their own "address space",
-;; that is why we need something in the state_init, which discriminates addresses
-;; in some sense type_id here is somewhat similar to subwallet_id in the standard wallet v3R2,
-;; but also different, because these (Blank) contracts are only intended to share the same upgrade functionality/exterior, but diverge with their "type"/underlying-functionality
-
-;; params - whatever other params other (future) contracts might need
-;; I (nns2009) think it is not necessary to add them here,
-;; because we can always make a new function for a new group of contracts when we need it, but others wanted it to stay
 cell platform::calculate_blank_state_init(
     cell blank_code,
     slice platform_address, slice owner_address,
-    int type_id, cell params
+    int type_id, int subaccount_id
 ) inline {
+	var data = begin_cell()
+		.store_slice(platform_address)
+		.store_slice(owner_address)
+		.store_uint(type_id, 8)
+		.store_uint(0, 1); ;; params = null
+
+	;; it is really not optimal to put subaccount_id into params cell, because that would require
+	;; additional cell creation for EACH user contract address calculation
+	;; therefore, it is optionally put after the old blank state init
+
+	if(subaccount_id != 0){
+		data = data.store_int(subaccount_id, 16);
+	}
+
     return pack_state_init(
         blank_code,
-        begin_cell()
-            .store_slice(platform_address)
-            .store_slice(owner_address)
-            .store_uint(type_id, 8)
-            .store_maybe_ref(params)
-            .end_cell()
+        data.end_cell()
     );
 }
 
@@ -88,15 +81,15 @@ cell calculate_user_init_data(int code_version, slice owner_address) {
   );
 }
 
-cell calculate_user_state_init(cell blank_code, slice owner_address) {
+cell calculate_user_state_init(cell blank_code, slice owner_address, int subaccount_id) {
   return platform::calculate_blank_state_init(
     blank_code,
     my_address(), owner_address,
-    0, null()
+    0, subaccount_id
   );
 }
 
-slice calculate_user_address(cell blank_code, slice owner_address) {
-  return calculate_address(calculate_user_state_init(blank_code, owner_address));
+slice calculate_user_address(cell blank_code, slice owner_address, int subaccount_id) {
+  return calculate_address(calculate_user_state_init(blank_code, owner_address, subaccount_id));
 }
 

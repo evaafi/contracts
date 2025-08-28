@@ -1,0 +1,20 @@
+#include "../external/stdlib.fc";
+
+(slice, cell, int, int, int, int) parse_oracles_info(slice oracles_info) impure {
+  slice pyth_address = oracles_info~load_msg_addr();
+  cell feeds_data = oracles_info~load_ref();
+  int prices_ttl = oracles_info~load_uint(32);
+  int pyth_compute_base_gas = oracles_info~load_uint(64);
+  int pyth_compute_per_update_gas = oracles_info~load_uint(64);
+  int pyth_single_update_fee = oracles_info~load_uint(64);
+  oracles_info.end_parse();
+  return (pyth_address, feeds_data, prices_ttl, pyth_compute_base_gas, pyth_compute_per_update_gas, pyth_single_update_fee);
+}
+
+(cell, cell) parse_feeds_data(cell feeds_data) impure {
+  slice feeds_slice = feeds_data.begin_parse();
+  cell pyth_to_evaa_map = feeds_slice~load_dict();
+  cell evaa_refs = feeds_slice~load_dict();
+  feeds_slice.end_parse();
+  return (pyth_to_evaa_map, evaa_refs);
+}

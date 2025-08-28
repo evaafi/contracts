@@ -1,6 +1,3 @@
-;; This file is licensed under the Business Source License (BUSL).
-;; See the LICENSE.md file in the project root for more information.
-
 #include "../external/stdlib.fc";
 #include "../data/universal-dict.fc";
 
@@ -41,47 +38,18 @@ int upgrade_config:user_code_version(cell config) inline {
 }
 
 ;; --------------- Master's universal_storage ---------------
-
+;;note need to have this function but it can be empty since we don`t use universal storage anymore
 (cell) master::upgrade::pack_universal_storage(
     cell meta, cell upgrade_config, cell asset_config_collection,
-    int if_active, slice oracles_info, slice admin, cell tokens_keys,
+    int if_active, cell oracles_info, slice admin, cell tokens_keys,
      cell asset_dynamics_collection
 ) method_id(0x153) {
+    ;; new data
     cell storage = new_dict();
-    storage~udict_set_builder(
-        256, "meta"H,
-        begin_cell().store_ref(meta)
-    );
-    storage~udict_set_builder(
-        256, "upgrade_config"H,
-        begin_cell().store_ref(upgrade_config)
-    );
-    storage~udict_set_builder(
-        256, "asset_config_collection"H,
-        begin_cell().store_dict(asset_config_collection)
-    );
-    storage~udict_set_builder(
-        256, "if_active"H,
-        begin_cell().store_int(if_active, 8)
-    );
-     storage~udict_set_builder(
-        256, "oracles_info"H,
-        begin_cell().store_slice(oracles_info)
-    );
-    storage~udict_set_builder(
-        256, "admin"H,
-        begin_cell().store_slice(admin)
-    );
-    storage~udict_set_builder(
-        256, "tokens_keys"H,
-        begin_cell().store_dict(tokens_keys)
-    );
-    storage~udict_set_builder(
-        256, "asset_dynamics_collection"H,
-        begin_cell().store_dict(asset_dynamics_collection)
-    );
     return storage;
 }
+
+;; --------------- Master's universal_storage ---------------
 
 (cell) master::upgrade::unpack_universal_storage(cell storage) method_id(0x157) {
     builder new_storage = begin_cell();
@@ -102,10 +70,10 @@ int upgrade_config:user_code_version(cell config) inline {
 
         slice value = storage.upgrade_storage:get!("admin"H);
         new_storage_ref = new_storage_ref.store_slice(value);
-
+        
         slice value = storage.upgrade_storage:get!("oracles_info"H);
         new_storage_ref = new_storage_ref.store_slice(value);
-        
+
         slice value = storage.upgrade_storage:get!("tokens_keys"H);
         new_storage_ref = new_storage_ref.store_dict(value~load_dict());
 
@@ -117,4 +85,5 @@ int upgrade_config:user_code_version(cell config) inline {
 
     return new_storage.end_cell();
 }
+
 

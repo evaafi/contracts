@@ -6,15 +6,25 @@ Welcome to the EVAA Protocol smart contracts GitHub repository! This repository 
 
 This project is licensed under the **Business Source License (BUSL) 1.1**. The full text of the license can be found in the [LICENSE.md](./LICENSE.md) file.
 
-# Audit
+# Audit of v8 by Trail of Bits
 
-The EVAA contracts have been audited by Quantstamp. You can read the full audit report here: [certificate](https://certificate.quantstamp.com/full/evaa/df7aa699-793b-49f7-b348-1f78e9ca9870/index.html).
+The EVAA v8 contracts have been audited by Trail of Bits. You can read the full audit report here: [certificate](https://github.com/trailofbits/publications/blob/master/reviews/2025-08-evaafinance-securityreview.pdf).
 
-*The version of the contract code matches the GitHub commit `55096cf1fd091629ff8dad783f71fb4758eded46` from the original repository.*
+*The version of the contract code in this repo matches the GitHub commit `ef9ea250b674e1d96c52ce12c4552778e10322b9` from the original repository.*
+
+*To verify that the code in the `./contracts` folder is the same as the audited version, compare the hashes of each file in this folder with the hashes listed in the Trail of Bits certificate.*
+
+*If you'd like to compare the hash of a specific file with the one in the audit report, check out current code in this repo. Then, generate the hash for the file and compare it with the one in the audit certificate.*
+
+# Audit of v6 by Quantstamp
+
+The EVAA v6 contracts have been audited by Quantstamp. You can read the full audit report here: [certificate](https://certificate.quantstamp.com/full/evaa/df7aa699-793b-49f7-b348-1f78e9ca9870/index.html).
+
+*The version of the v6 contract code matches the GitHub commit `55096cf1fd091629ff8dad783f71fb4758eded46` from the original repository.*
 
 *To verify that the code in the `./contracts` folder is the same as the audited version, compare the hashes of each file in this folder with the hashes listed in the Quantstamp certificate.*
 
-*If you'd like to compare the hash of a specific file with the one in the audit report, check out the previous commit `1fb4e31dd7874391e34bae2cdfa5dd0d48b5d181`. This (last) commit contains the same code, with no logic changes, only updated comments. Then, generate the hash for the file and compare it with the one in the audit certificate.*
+*If you'd like to compare the hash of a specific file with the one in the audit report, check out commit `1fb4e31dd7874391e34bae2cdfa5dd0d48b5d181` in this repo. Then, generate the hash for the file and compare it with the one in the audit certificate.*
 
 # Links
 
